@@ -4,7 +4,8 @@ use crate::{
     block::SolizoneBlock,
     block_builder::build_block,
     execution::{
-        BlockContext, RejectedTransaction, RevmExecutionEngine, transaction::SolizoneTransaction,
+        BlockContext, RejectedTransaction, RevmExecutionEngine, receipt::ExecutionReceipt,
+        transaction::SolizoneTransaction,
     },
     state::MemoryState,
 };
@@ -13,6 +14,8 @@ use crate::{
 #[derive(Debug)]
 pub struct ProducedBlock {
     pub block: SolizoneBlock,
+    /// Receipts aligned one-to-one with `block.transactions`.
+    pub receipts: Vec<ExecutionReceipt>,
     pub rejected: Vec<RejectedTransaction>,
 }
 
@@ -102,6 +105,7 @@ impl BlockProducer {
 
         ProducedBlock {
             block,
+            receipts: outcome.receipts,
             rejected: outcome.rejected,
         }
     }
@@ -143,6 +147,7 @@ mod tests {
             value: U256::from(value),
             data: Bytes::new(),
             gas_limit,
+            signed: None,
         }
     }
 
@@ -252,6 +257,7 @@ mod tests {
             value: U256::from(100),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block_0 = producer.produce_block(&engine, &mut state, &transactions_0, 1_800_000_000);
@@ -275,6 +281,7 @@ mod tests {
             value: U256::from(200),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block_1 = producer.produce_block(&engine, &mut state, &transactions_1, 1_800_000_001);
@@ -336,6 +343,7 @@ mod tests {
             value: U256::from(100),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block_0 = producer.produce_block(&engine, &mut state, &transactions_0, 1_800_000_000);
@@ -351,6 +359,7 @@ mod tests {
             value: U256::from(200),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block_1 = producer.produce_block(&engine, &mut state, &transactions_1, 1_800_000_001);
@@ -388,6 +397,7 @@ mod tests {
             value: U256::from(300),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block_2 =
@@ -486,6 +496,7 @@ mod tests {
             value: U256::from(100),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block_0 = producer.produce_block(&engine, &mut state, &transactions_0, 1_800_000_000);
@@ -501,6 +512,7 @@ mod tests {
             value: U256::from(200),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block_1 = producer.produce_block(&engine, &mut state, &transactions_1, 1_800_000_001);
@@ -557,6 +569,7 @@ mod tests {
             value: U256::from(300),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block_2 = restored_producer.produce_block(
@@ -676,6 +689,7 @@ mod tests {
             value: U256::from(100),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block_0 = producer.produce_block(&engine, &mut state, &transactions_0, 1_800_000_000);
@@ -694,6 +708,7 @@ mod tests {
             value: U256::from(200),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block_1 = producer.produce_block(&engine, &mut state, &transactions_1, 1_800_000_001);
@@ -796,6 +811,7 @@ mod tests {
             value: U256::from(300),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block_2 = restored_producer.produce_block(

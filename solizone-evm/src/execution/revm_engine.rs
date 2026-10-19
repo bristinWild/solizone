@@ -14,6 +14,9 @@ use crate::execution::transaction::{SolizoneTransaction, TransactionKind};
 
 use crate::state::MemoryState;
 
+/// Per-transaction gas cap enforced by REVM's default (Osaka) spec, EIP-7825.
+pub const MAX_TX_GAS: u64 = revm::primitives::eip7825::TX_GAS_LIMIT_CAP;
+
 /// A transaction REVM refused to execute (bad nonce, insufficient funds,
 /// gas limit above the block limit, ...). Such a transaction produces no
 /// receipt, does not change state, and must not be included in a block.
@@ -236,6 +239,7 @@ impl RevmExecutionEngine {
             value,
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         };
 
         let receipt = self.execute_transaction(state, &tx);
@@ -518,6 +522,7 @@ impl RevmExecutionEngine {
             value: U256::ZERO,
             data: counter_creation_bytecode(),
             gas_limit: 500_000, // keep the same deployment gas limit you were already using
+            signed: None,
         };
 
         println!("Deploy transaction hash: {}", deploy_tx.hash());
@@ -558,6 +563,7 @@ impl RevmExecutionEngine {
                 0xd0, 0x9d, 0xe0, 0x8a, // increment()
             ]),
             gas_limit: 100_000,
+            signed: None,
         };
 
         println!("Increment transaction hash: {}", increment_tx.hash());
@@ -781,6 +787,7 @@ mod tests {
                     value: U256::ZERO,
                     data: Bytes::from(hex::decode(BLOCK_ENV_PROBE_INITCODE).unwrap()),
                     gas_limit: 200_000,
+                    signed: None,
                 },
             )
             .expect("probe deployment should be valid");
@@ -798,6 +805,7 @@ mod tests {
                     value: U256::ZERO,
                     data: Bytes::new(),
                     gas_limit: 100_000,
+                    signed: None,
                 },
             )
             .expect("probe call should be valid");
@@ -827,6 +835,7 @@ mod tests {
             value: U256::from(value),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         };
 
         let wrong_nonce = engine.try_execute_transaction(&ctx, &mut state, &transfer(alice, 7, 1));
@@ -1223,6 +1232,7 @@ mod tests {
             value: U256::ZERO,
             data: counter_creation_bytecode(),
             gas_limit: 500_000,
+            signed: None,
         };
 
         let deploy_receipt = engine.execute_transaction(&mut state, &deploy_tx);
@@ -1243,6 +1253,7 @@ mod tests {
                 0xd0, 0x9d, 0xe0, 0x8a, // increment()
             ]),
             gas_limit: 100_000,
+            signed: None,
         };
 
         let increment_receipt = engine.execute_transaction(&mut state, &increment_tx);
@@ -1261,6 +1272,7 @@ mod tests {
                 0x06, 0x66, 0x1a, 0xbd, // count()
             ]),
             gas_limit: 100_000,
+            signed: None,
         };
 
         let read_receipt = engine.execute_call(&mut state, &read_tx);
@@ -1372,6 +1384,7 @@ mod tests {
             value: U256::ZERO,
             data: counter_creation_bytecode(),
             gas_limit: 500_000,
+            signed: None,
         };
 
         let deploy_receipt = engine.execute_transaction(&mut state, &deploy_tx);
@@ -1390,6 +1403,7 @@ mod tests {
             value: U256::ZERO,
             data: Bytes::from_static(&[0xd0, 0x9d, 0xe0, 0x8a]),
             gas_limit: 100_000,
+            signed: None,
         };
 
         let increment_receipt = engine.execute_transaction(&mut state, &increment_tx);
@@ -1422,6 +1436,7 @@ mod tests {
             value: U256::ZERO,
             data: Bytes::from_static(&[0x06, 0x66, 0x1a, 0xbd]),
             gas_limit: 100_000,
+            signed: None,
         };
 
         let read_receipt = engine.execute_call(&mut restored, &read_tx);
@@ -1489,6 +1504,7 @@ mod tests {
             value: U256::from(100),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         };
 
         let receipt = engine.execute_transaction(&mut state, &tx);
@@ -1538,6 +1554,7 @@ mod tests {
                 value: U256::from(100),
                 data: Bytes::new(),
                 gas_limit: 21_000,
+                signed: None,
             },
             SolizoneTransaction {
                 sender,
@@ -1546,6 +1563,7 @@ mod tests {
                 value: U256::from(200),
                 data: Bytes::new(),
                 gas_limit: 21_000,
+                signed: None,
             },
         ];
 
@@ -1599,6 +1617,7 @@ mod tests {
                 value: U256::from(100),
                 data: Bytes::new(),
                 gas_limit: 21_000,
+                signed: None,
             },
             SolizoneTransaction {
                 sender,
@@ -1607,6 +1626,7 @@ mod tests {
                 value: U256::from(200),
                 data: Bytes::new(),
                 gas_limit: 21_000,
+                signed: None,
             },
         ];
 
@@ -1687,6 +1707,7 @@ mod tests {
             value: U256::from(100),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let outcome_0 = engine.execute_block(&mut state, &block_0_transactions);
@@ -1720,6 +1741,7 @@ mod tests {
             value: U256::from(200),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let outcome_1 = engine.execute_block(&mut state, &block_1_transactions);

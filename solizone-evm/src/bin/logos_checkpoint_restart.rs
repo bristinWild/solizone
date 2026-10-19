@@ -64,6 +64,7 @@ fn write_checkpoint() -> Result<(), String> {
         value: U256::from(100),
         data: Bytes::new(),
         gas_limit: 21_000,
+        signed: None,
     };
 
     let block_0 = producer.produce_block(&engine, &mut state, &[tx_0], 1_800_000_000);
@@ -79,6 +80,7 @@ fn write_checkpoint() -> Result<(), String> {
         value: U256::from(200),
         data: Bytes::new(),
         gas_limit: 21_000,
+        signed: None,
     };
 
     let block_1 = producer.produce_block(&engine, &mut state, &[tx_1], 1_800_000_001);
@@ -148,6 +150,7 @@ fn recover_checkpoint() -> Result<(), String> {
         value: U256::from(300),
         data: Bytes::new(),
         gas_limit: 21_000,
+        signed: None,
     };
 
     let expected_parent = checkpoint.parent_hash;

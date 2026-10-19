@@ -40,6 +40,7 @@ fn main() {
         value: U256::ZERO,
         data: counter_creation_bytecode(),
         gas_limit: 500_000,
+        signed: None,
     };
 
     let deploy_receipt = engine.execute_transaction(&mut state, &deploy_tx);
@@ -56,6 +57,7 @@ fn main() {
         value: U256::ZERO,
         data: Bytes::from_static(&[0xd0, 0x9d, 0xe0, 0x8a]),
         gas_limit: 100_000,
+        signed: None,
     };
 
     engine.execute_transaction(&mut state, &increment_tx);
