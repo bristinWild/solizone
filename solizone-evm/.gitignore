@@ -2,8 +2,6 @@
 /Cargo.lock
 /contracts-out
 /cache
-/contracts/Counter.creation.hex
-/contracts/Counter.runtime.hex
 /.state/
 /storage-data
 solizone-config.json

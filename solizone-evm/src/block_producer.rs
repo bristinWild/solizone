@@ -3,9 +3,18 @@ use revm::primitives::B256;
 use crate::{
     block::SolizoneBlock,
     block_builder::build_block,
-    execution::{RevmExecutionEngine, transaction::SolizoneTransaction},
+    execution::{
+        BlockContext, RejectedTransaction, RevmExecutionEngine, transaction::SolizoneTransaction,
+    },
     state::MemoryState,
 };
+
+/// A produced block plus the candidate transactions that were left out.
+#[derive(Debug)]
+pub struct ProducedBlock {
+    pub block: SolizoneBlock,
+    pub rejected: Vec<RejectedTransaction>,
+}
 
 pub struct BlockProducer {
     version: u16,
@@ -42,6 +51,14 @@ impl BlockProducer {
         }
     }
 
+    /// Block context contracts will see in the next produced block.
+    pub fn block_context(&self, timestamp: u64) -> BlockContext {
+        BlockContext::new(self.chain_id, self.next_height, timestamp, self.gas_limit)
+    }
+
+    /// Produces the next block. Invalid candidate transactions are excluded
+    /// from the block and silently dropped; use `produce_block_with_report`
+    /// to see them.
     pub fn produce_block(
         &mut self,
         engine: &RevmExecutionEngine,
@@ -49,7 +66,23 @@ impl BlockProducer {
         transactions: &[SolizoneTransaction],
         timestamp: u64,
     ) -> SolizoneBlock {
-        let outcome = engine.execute_block(state, transactions);
+        self.produce_block_with_report(engine, state, transactions, timestamp)
+            .block
+    }
+
+    /// Produces the next block under this producer's block context
+    /// (chain id, height, timestamp, gas limit) and reports rejected
+    /// candidate transactions instead of panicking on them.
+    pub fn produce_block_with_report(
+        &mut self,
+        engine: &RevmExecutionEngine,
+        state: &mut MemoryState,
+        transactions: &[SolizoneTransaction],
+        timestamp: u64,
+    ) -> ProducedBlock {
+        let ctx = self.block_context(timestamp);
+
+        let outcome = engine.execute_block_checked(&ctx, state, transactions);
 
         let block = build_block(
             self.version,
@@ -58,7 +91,7 @@ impl BlockProducer {
             self.parent_hash,
             timestamp,
             outcome.state_root,
-            transactions,
+            &outcome.included,
             &outcome.receipts,
             self.gas_limit,
         );
@@ -67,7 +100,10 @@ impl BlockProducer {
 
         self.next_height += 1;
 
-        block
+        ProducedBlock {
+            block,
+            rejected: outcome.rejected,
+        }
     }
 
     pub fn next_height(&self) -> u64 {
@@ -91,6 +127,105 @@ mod tests {
     use crate::execution::transaction::{SolizoneTransaction, TransactionKind};
 
     use crate::{block_store::BlockStore, memory_block_store::MemoryBlockStore};
+
+    use crate::execution::ExecutionError;
+
+    fn transfer(
+        sender: revm::primitives::Address,
+        nonce: u64,
+        value: u64,
+        gas_limit: u64,
+    ) -> SolizoneTransaction {
+        SolizoneTransaction {
+            sender,
+            nonce,
+            kind: TransactionKind::Call(address!("2222222222222222222222222222222222222222")),
+            value: U256::from(value),
+            data: Bytes::new(),
+            gas_limit,
+        }
+    }
+
+    #[test]
+    fn excludes_invalid_transactions_instead_of_panicking() {
+        let engine = RevmExecutionEngine::new();
+        let alice = address!("1111111111111111111111111111111111111111");
+        let broke = address!("9999999999999999999999999999999999999999");
+        let mut state = MemoryState::new();
+        state.insert_account_info(alice, AccountInfo::from_balance(U256::from(1_000)));
+
+        let mut producer = BlockProducer::new(1, 9001, 30_000_000);
+
+        let candidates = vec![
+            transfer(alice, 0, 100, 21_000), // valid
+            transfer(alice, 5, 100, 21_000), // nonce gap
+            transfer(broke, 0, 1, 21_000),   // unfunded sender
+            transfer(alice, 1, 100, 21_000), // valid
+        ];
+
+        let produced =
+            producer.produce_block_with_report(&engine, &mut state, &candidates, 1_800_000_000);
+
+        assert_eq!(
+            produced.block.transactions,
+            vec![candidates[0].clone(), candidates[3].clone()]
+        );
+        assert!(produced.block.validate().is_ok());
+        assert_eq!(produced.rejected.len(), 2);
+        assert_eq!(produced.rejected[0].transaction, candidates[1]);
+        assert_eq!(produced.rejected[1].transaction, candidates[2]);
+        assert_eq!(producer.next_height(), 1);
+        assert_eq!(producer.parent_hash(), produced.block.hash());
+    }
+
+    #[test]
+    fn rejects_transactions_beyond_block_gas_limit() {
+        let engine = RevmExecutionEngine::new();
+        let alice = address!("1111111111111111111111111111111111111111");
+        let mut state = MemoryState::new();
+        state.insert_account_info(alice, AccountInfo::from_balance(U256::from(1_000)));
+
+        // Room for exactly two 21k transfers.
+        let mut producer = BlockProducer::new(1, 9001, 42_000);
+
+        let candidates = vec![
+            transfer(alice, 0, 1, 21_000),
+            transfer(alice, 1, 1, 21_000),
+            transfer(alice, 2, 1, 21_000),
+        ];
+
+        let produced =
+            producer.produce_block_with_report(&engine, &mut state, &candidates, 1_800_000_000);
+
+        assert_eq!(produced.block.transactions.len(), 2);
+        assert_eq!(produced.rejected.len(), 1);
+        assert!(matches!(
+            produced.rejected[0].error,
+            ExecutionError::BlockGasLimitExceeded {
+                tx_gas_limit: 21_000,
+                remaining: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn block_context_tracks_chain_head() {
+        let engine = RevmExecutionEngine::new();
+        let alice = address!("1111111111111111111111111111111111111111");
+        let mut state = MemoryState::new();
+        state.insert_account_info(alice, AccountInfo::from_balance(U256::from(1_000)));
+
+        let mut producer = BlockProducer::new(1, 9001, 30_000_000);
+        assert_eq!(producer.block_context(10).number, 0);
+
+        producer.produce_block(&engine, &mut state, &[transfer(alice, 0, 1, 21_000)], 10);
+
+        let ctx = producer.block_context(15);
+        assert_eq!(
+            (ctx.chain_id, ctx.number, ctx.timestamp, ctx.gas_limit),
+            (9001, 1, 15, 30_000_000)
+        );
+    }
 
     #[test]
     fn produces_linked_blocks_automatically() {
