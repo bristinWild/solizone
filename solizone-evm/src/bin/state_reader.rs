@@ -43,6 +43,7 @@ fn main() {
         value: U256::ZERO,
         data: Bytes::from_static(&[0x06, 0x66, 0x1a, 0xbd]),
         gas_limit: 100_000,
+        signed: None,
     };
 
     let read_receipt = engine.execute_call(&mut state, &read_tx);
@@ -68,6 +69,7 @@ fn main() {
             0xd0, 0x9d, 0xe0, 0x8a, // increment()
         ]),
         gas_limit: 100_000,
+        signed: None,
     };
 
     let increment_receipt = engine.execute_transaction(&mut state, &increment_tx);
@@ -81,6 +83,7 @@ fn main() {
             0x06, 0x66, 0x1a, 0xbd, // count()
         ]),
         gas_limit: 100_000,
+        signed: None,
     };
 
     let read_after_receipt = engine.execute_call(&mut state, &read_after_increment);

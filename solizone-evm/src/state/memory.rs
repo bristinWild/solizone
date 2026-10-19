@@ -8,6 +8,7 @@ use crate::state::snapshot::{AccountSnapshot, StateSnapshot, StorageSlotSnapshot
 use revm::primitives::B256;
 use revm_bytecode::Bytecode;
 
+#[derive(Clone)]
 pub struct MemoryState {
     db: InMemoryDB,
 }

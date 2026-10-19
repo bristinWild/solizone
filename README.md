@@ -28,6 +28,10 @@ Today, Solizone can:
 - validate and hash-check blocks recovered from Logos Storage
 - publish canonical Solizone block bytes through the Logos Zone SDK
 - observe published blocks reaching Logos finality
+- accept signed Ethereum transactions (legacy EIP-155, EIP-2930, EIP-1559) and recover senders
+- queue them in a Solizone mempool with pending-state admission checks
+- store signed transactions in blocks as raw bytes (`SZT2` / `SZB2`)
+- serve an Ethereum JSON-RPC endpoint: `forge create`, `forge script`, `cast send` / `call` and viem/ethers work against it
 
 ---
 
@@ -36,9 +40,9 @@ Today, Solizone can:
 ```text
 Ethereum tooling
       ↓
-Ethereum JSON-RPC                     (next phase)
+Ethereum JSON-RPC
       ↓
-Solizone transaction pool             (next phase)
+Solizone transaction pool
       ↓
 BlockProducer
       ↓
@@ -179,13 +183,12 @@ ordering / consensus / finality
 
 ## Next milestones
 
-1. Design raw signed Ethereum transaction ingestion.
-2. Add a Solizone transaction pool.
-3. Implement signature recovery and transaction admission rules.
-4. Add a minimal Ethereum-compatible JSON-RPC surface.
-5. Connect Foundry, ethers, viem, and wallets.
-6. Add independent block re-execution / validation.
-7. Continue hardening the node, storage, and Logos publication paths.
+1. ~~Raw signed Ethereum transactions, mempool, JSON-RPC, Foundry support.~~ Done.
+2. Persist receipts and the transaction index across restarts.
+3. Publish produced blocks to Logos from inside the node (durable publisher).
+4. Zoner: build / test / deploy toolkit on top of the JSON-RPC surface.
+5. Add independent block re-execution / validation.
+6. Continue hardening the node, storage, and Logos publication paths.
 
 ---
 
@@ -198,16 +201,32 @@ cargo check
 cargo test
 ```
 
-Run the long-running Solizone node:
+Run the long-running Solizone node (Logos Storage backed):
 
 ```bash
 cargo run --bin solizone_node
 ```
 
-Reset the local node runtime state:
+Or on local disk only, with no Basecamp needed:
 
 ```bash
-cargo run --bin solizone_node -- reset
+cargo run --bin solizone_node -- --storage local
+```
+
+Either way it serves Ethereum JSON-RPC on `http://127.0.0.1:8545`
+(chain id 9001) and prints funded dev accounts on first start:
+
+```bash
+forge create contracts/Counter.sol:Counter --broadcast \
+  --rpc-url http://127.0.0.1:8545 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+```
+
+Reset node state:
+
+```bash
+cargo run --bin solizone_node -- reset                    # logos storage
+cargo run --bin solizone_node -- reset --storage local    # local storage
 ```
 
 Run the Logos publication harness:

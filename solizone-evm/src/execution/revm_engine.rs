@@ -8,15 +8,73 @@ use revm::{
     state::AccountInfo,
 };
 
+use crate::execution::block_context::BlockContext;
+
 use crate::execution::transaction::{SolizoneTransaction, TransactionKind};
 
-use crate::execution::receipt::ExecutionStatus;
-
-use crate::execution::receipts_root::{
-    build_receipt_proof, compute_receipts_root, verify_receipt_proof,
-};
-
 use crate::state::MemoryState;
+
+/// Per-transaction gas cap enforced by REVM's default (Osaka) spec, EIP-7825.
+pub const MAX_TX_GAS: u64 = revm::primitives::eip7825::TX_GAS_LIMIT_CAP;
+
+/// A transaction REVM refused to execute (bad nonce, insufficient funds,
+/// gas limit above the block limit, ...). Such a transaction produces no
+/// receipt, does not change state, and must not be included in a block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionError {
+    InvalidTransaction(String),
+    BlockGasLimitExceeded { tx_gas_limit: u64, remaining: u64 },
+}
+
+impl std::fmt::Display for ExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTransaction(reason) => write!(f, "invalid transaction: {reason}"),
+            Self::BlockGasLimitExceeded {
+                tx_gas_limit,
+                remaining,
+            } => write!(
+                f,
+                "transaction gas limit {tx_gas_limit} exceeds remaining block gas {remaining}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExecutionError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedTransaction {
+    pub transaction: SolizoneTransaction,
+    pub error: ExecutionError,
+}
+
+/// Result of executing a candidate transaction list into a block.
+///
+/// `included` and `receipts` are aligned one-to-one; rejected transactions
+/// appear only in `rejected`.
+#[derive(Debug)]
+pub struct CheckedBlockExecution {
+    pub included: Vec<SolizoneTransaction>,
+    pub receipts: Vec<ExecutionReceipt>,
+    pub rejected: Vec<RejectedTransaction>,
+    pub state_root: B256,
+}
+
+fn build_tx_env(ctx: &BlockContext, tx: &SolizoneTransaction) -> Result<TxEnv, ExecutionError> {
+    TxEnv::builder()
+        .caller(tx.sender)
+        .kind(tx.revm_kind())
+        .value(tx.value)
+        .data(tx.data.clone())
+        .gas_limit(tx.gas_limit)
+        .gas_price(0)
+        .gas_priority_fee(None)
+        .nonce(tx.nonce)
+        .chain_id(Some(ctx.chain_id))
+        .build()
+        .map_err(|error| ExecutionError::InvalidTransaction(format!("{error:?}")))
+}
 
 #[derive(Debug)]
 pub struct TransferOutcome {
@@ -78,58 +136,84 @@ impl RevmExecutionEngine {
         Self
     }
 
+    /// Executes and commits a transaction under an explicit block context.
+    ///
+    /// Invalid transactions return `Err` and leave `state` unchanged instead
+    /// of panicking. This is the path node block production uses.
+    pub fn try_execute_transaction(
+        &self,
+        ctx: &BlockContext,
+        state: &mut MemoryState,
+        tx: &SolizoneTransaction,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
+        let tx_env = build_tx_env(ctx, tx)?;
+
+        let mut evm = Self::evm_context(ctx, state.db_mut()).build_mainnet();
+
+        let result = evm
+            .transact_commit(tx_env)
+            .map_err(|error| ExecutionError::InvalidTransaction(format!("{error:?}")))?;
+
+        Ok(ExecutionReceipt::from_revm(&result))
+    }
+
+    /// Read-only execution under an explicit block context (the basis for a
+    /// future `eth_call`). State is never modified.
+    pub fn try_execute_call(
+        &self,
+        ctx: &BlockContext,
+        state: &mut MemoryState,
+        tx: &SolizoneTransaction,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
+        let tx_env = build_tx_env(ctx, tx)?;
+
+        let mut evm = Self::evm_context(ctx, state.db_mut()).build_mainnet();
+
+        let output = evm
+            .transact(tx_env)
+            .map_err(|error| ExecutionError::InvalidTransaction(format!("{error:?}")))?;
+
+        Ok(ExecutionReceipt::from_revm(&output.result))
+    }
+
+    fn evm_context<'a>(
+        ctx: &BlockContext,
+        db: &'a mut InMemoryDB,
+    ) -> revm::handler::MainnetContext<&'a mut InMemoryDB> {
+        let ctx = *ctx;
+
+        Context::mainnet()
+            .with_db(db)
+            .modify_cfg_chained(|cfg| cfg.chain_id = ctx.chain_id)
+            .modify_block_chained(|block| {
+                block.number = U256::from(ctx.number);
+                block.timestamp = U256::from(ctx.timestamp);
+                block.gas_limit = ctx.gas_limit;
+                block.beneficiary = ctx.beneficiary;
+                block.basefee = ctx.basefee;
+            })
+    }
+
+    /// Context-free helper kept for existing tests and demo binaries.
+    /// Uses `BlockContext::default()` and panics on invalid transactions;
+    /// node code should use `try_execute_transaction`.
     pub fn execute_transaction(
         &self,
         state: &mut MemoryState,
         tx: &SolizoneTransaction,
     ) -> ExecutionReceipt {
-        let tx_env = TxEnv::builder()
-            .caller(tx.sender)
-            .kind(tx.revm_kind())
-            .value(tx.value)
-            .data(tx.data.clone())
-            .gas_limit(tx.gas_limit)
-            .gas_price(0)
-            .gas_priority_fee(None)
-            .nonce(tx.nonce)
-            .build()
-            .expect("failed to build REVM transaction");
-
-        let result = {
-            let mut evm = Context::mainnet().with_db(state.db_mut()).build_mainnet();
-
-            evm.transact_commit(tx_env).expect("EVM transaction failed")
-        };
-
-        ExecutionReceipt::from_revm(&result)
+        self.try_execute_transaction(&BlockContext::default(), state, tx)
+            .unwrap_or_else(|error| panic!("EVM transaction failed: {error}"))
     }
 
+    /// Context-free read-only helper; see `execute_transaction`.
     pub fn execute_call(
         &self,
         state: &mut MemoryState,
         tx: &SolizoneTransaction,
     ) -> ExecutionReceipt {
-        let tx_env = TxEnv::builder()
-            .caller(tx.sender)
-            .kind(tx.revm_kind())
-            .value(tx.value)
-            .data(tx.data.clone())
-            .gas_limit(tx.gas_limit)
-            .gas_price(0)
-            .gas_priority_fee(None)
-            .nonce(tx.nonce)
-            .build()
-            .expect("failed to build REVM call");
-
-        let result = {
-            let mut evm = Context::mainnet().with_db(state.db_mut()).build_mainnet();
-
-            let output = evm.transact(tx_env).expect("EVM call failed");
-
-            output.result
-        };
-
-        ExecutionReceipt::from_revm(&result)
+        self.try_execute_call(&BlockContext::default(), state, tx)
+            .unwrap_or_else(|error| panic!("EVM call failed: {error}"))
     }
 
     pub fn execute_transfer(
@@ -155,6 +239,7 @@ impl RevmExecutionEngine {
             value,
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         };
 
         let receipt = self.execute_transaction(state, &tx);
@@ -437,6 +522,7 @@ impl RevmExecutionEngine {
             value: U256::ZERO,
             data: counter_creation_bytecode(),
             gas_limit: 500_000, // keep the same deployment gas limit you were already using
+            signed: None,
         };
 
         println!("Deploy transaction hash: {}", deploy_tx.hash());
@@ -477,6 +563,7 @@ impl RevmExecutionEngine {
                 0xd0, 0x9d, 0xe0, 0x8a, // increment()
             ]),
             gas_limit: 100_000,
+            signed: None,
         };
 
         println!("Increment transaction hash: {}", increment_tx.hash());
@@ -609,12 +696,175 @@ impl RevmExecutionEngine {
             state_root,
         }
     }
+
+    /// Executes candidate transactions in order under `ctx`, Ethereum-style:
+    /// a transaction REVM rejects, or one whose gas limit no longer fits in
+    /// the remaining block gas, is skipped and reported instead of included.
+    pub fn execute_block_checked(
+        &self,
+        ctx: &BlockContext,
+        state: &mut MemoryState,
+        transactions: &[SolizoneTransaction],
+    ) -> CheckedBlockExecution {
+        let mut included = Vec::with_capacity(transactions.len());
+        let mut receipts = Vec::with_capacity(transactions.len());
+        let mut rejected = Vec::new();
+        let mut gas_used: u64 = 0;
+
+        for tx in transactions {
+            let remaining = ctx.gas_limit.saturating_sub(gas_used);
+
+            if tx.gas_limit > remaining {
+                rejected.push(RejectedTransaction {
+                    transaction: tx.clone(),
+                    error: ExecutionError::BlockGasLimitExceeded {
+                        tx_gas_limit: tx.gas_limit,
+                        remaining,
+                    },
+                });
+                continue;
+            }
+
+            match self.try_execute_transaction(ctx, state, tx) {
+                Ok(receipt) => {
+                    gas_used = gas_used.saturating_add(receipt.gas_used);
+                    included.push(tx.clone());
+                    receipts.push(receipt);
+                }
+                Err(error) => rejected.push(RejectedTransaction {
+                    transaction: tx.clone(),
+                    error,
+                }),
+            }
+        }
+
+        CheckedBlockExecution {
+            included,
+            receipts,
+            rejected,
+            state_root: state.state_root(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::receipt::ExecutionStatus;
+    use crate::execution::receipts_root::{
+        build_receipt_proof, compute_receipts_root, verify_receipt_proof,
+    };
     use revm::primitives::address;
+
+    /// Hand-assembled contract whose runtime returns
+    /// abi.encode(block.chainid, block.number, block.timestamp).
+    /// init:    PUSH1 0x0f PUSH1 0x0a PUSH0 CODECOPY PUSH1 0x0f PUSH0 RETURN
+    /// runtime: CHAINID PUSH0 MSTORE NUMBER PUSH1 0x20 MSTORE
+    ///          TIMESTAMP PUSH1 0x40 MSTORE PUSH1 0x60 PUSH0 RETURN
+    const BLOCK_ENV_PROBE_INITCODE: &str = "600f600a5f39600f5ff3465f52436020524260405260605ff3";
+
+    fn word(output: &Bytes, index: usize) -> U256 {
+        U256::from_be_slice(&output[index * 32..(index + 1) * 32])
+    }
+
+    #[test]
+    fn contracts_see_block_context() {
+        let engine = RevmExecutionEngine::new();
+        let deployer = address!("1111111111111111111111111111111111111111");
+        let mut state = MemoryState::new();
+        state.insert_account_info(deployer, AccountInfo::from_balance(U256::from(1_000_000)));
+
+        let ctx = BlockContext::new(9001, 42, 1_800_000_000, 30_000_000);
+
+        let deploy = engine
+            .try_execute_transaction(
+                &ctx,
+                &mut state,
+                &SolizoneTransaction {
+                    sender: deployer,
+                    nonce: 0,
+                    kind: TransactionKind::Create,
+                    value: U256::ZERO,
+                    data: Bytes::from(hex::decode(BLOCK_ENV_PROBE_INITCODE).unwrap()),
+                    gas_limit: 200_000,
+                    signed: None,
+                },
+            )
+            .expect("probe deployment should be valid");
+
+        let probe = deploy.contract_address.expect("probe address");
+
+        let read = engine
+            .try_execute_call(
+                &ctx,
+                &mut state,
+                &SolizoneTransaction {
+                    sender: deployer,
+                    nonce: 1,
+                    kind: TransactionKind::Call(probe),
+                    value: U256::ZERO,
+                    data: Bytes::new(),
+                    gas_limit: 100_000,
+                    signed: None,
+                },
+            )
+            .expect("probe call should be valid");
+
+        assert_eq!(read.status, ExecutionStatus::Success);
+        assert_eq!(word(&read.output, 0), U256::from(9001));
+        assert_eq!(word(&read.output, 1), U256::from(42));
+        assert_eq!(word(&read.output, 2), U256::from(1_800_000_000u64));
+    }
+
+    #[test]
+    fn invalid_transactions_return_errors_without_touching_state() {
+        let engine = RevmExecutionEngine::new();
+        let alice = address!("1111111111111111111111111111111111111111");
+        let bob = address!("2222222222222222222222222222222222222222");
+        let broke = address!("9999999999999999999999999999999999999999");
+        let mut state = MemoryState::new();
+        state.insert_account_info(alice, AccountInfo::from_balance(U256::from(1_000)));
+
+        let ctx = BlockContext::new(9001, 0, 1_800_000_000, 30_000_000);
+        let root_before = state.state_root();
+
+        let transfer = |sender, nonce, value: u64| SolizoneTransaction {
+            sender,
+            nonce,
+            kind: TransactionKind::Call(bob),
+            value: U256::from(value),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+            signed: None,
+        };
+
+        let wrong_nonce = engine.try_execute_transaction(&ctx, &mut state, &transfer(alice, 7, 1));
+        assert!(matches!(
+            wrong_nonce,
+            Err(ExecutionError::InvalidTransaction(_))
+        ));
+
+        let unfunded = engine.try_execute_transaction(&ctx, &mut state, &transfer(broke, 0, 1));
+        assert!(matches!(
+            unfunded,
+            Err(ExecutionError::InvalidTransaction(_))
+        ));
+
+        let overspend =
+            engine.try_execute_transaction(&ctx, &mut state, &transfer(alice, 0, 5_000));
+        assert!(matches!(
+            overspend,
+            Err(ExecutionError::InvalidTransaction(_))
+        ));
+
+        assert_eq!(state.state_root(), root_before);
+
+        let valid = engine.try_execute_transaction(&ctx, &mut state, &transfer(alice, 0, 100));
+        assert_eq!(
+            valid.expect("valid transfer").status,
+            ExecutionStatus::Success
+        );
+    }
 
     #[test]
     fn executes_value_transfer() {
@@ -982,6 +1232,7 @@ mod tests {
             value: U256::ZERO,
             data: counter_creation_bytecode(),
             gas_limit: 500_000,
+            signed: None,
         };
 
         let deploy_receipt = engine.execute_transaction(&mut state, &deploy_tx);
@@ -1002,6 +1253,7 @@ mod tests {
                 0xd0, 0x9d, 0xe0, 0x8a, // increment()
             ]),
             gas_limit: 100_000,
+            signed: None,
         };
 
         let increment_receipt = engine.execute_transaction(&mut state, &increment_tx);
@@ -1020,6 +1272,7 @@ mod tests {
                 0x06, 0x66, 0x1a, 0xbd, // count()
             ]),
             gas_limit: 100_000,
+            signed: None,
         };
 
         let read_receipt = engine.execute_call(&mut state, &read_tx);
@@ -1131,6 +1384,7 @@ mod tests {
             value: U256::ZERO,
             data: counter_creation_bytecode(),
             gas_limit: 500_000,
+            signed: None,
         };
 
         let deploy_receipt = engine.execute_transaction(&mut state, &deploy_tx);
@@ -1149,6 +1403,7 @@ mod tests {
             value: U256::ZERO,
             data: Bytes::from_static(&[0xd0, 0x9d, 0xe0, 0x8a]),
             gas_limit: 100_000,
+            signed: None,
         };
 
         let increment_receipt = engine.execute_transaction(&mut state, &increment_tx);
@@ -1181,6 +1436,7 @@ mod tests {
             value: U256::ZERO,
             data: Bytes::from_static(&[0x06, 0x66, 0x1a, 0xbd]),
             gas_limit: 100_000,
+            signed: None,
         };
 
         let read_receipt = engine.execute_call(&mut restored, &read_tx);
@@ -1248,6 +1504,7 @@ mod tests {
             value: U256::from(100),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         };
 
         let receipt = engine.execute_transaction(&mut state, &tx);
@@ -1297,6 +1554,7 @@ mod tests {
                 value: U256::from(100),
                 data: Bytes::new(),
                 gas_limit: 21_000,
+                signed: None,
             },
             SolizoneTransaction {
                 sender,
@@ -1305,6 +1563,7 @@ mod tests {
                 value: U256::from(200),
                 data: Bytes::new(),
                 gas_limit: 21_000,
+                signed: None,
             },
         ];
 
@@ -1358,6 +1617,7 @@ mod tests {
                 value: U256::from(100),
                 data: Bytes::new(),
                 gas_limit: 21_000,
+                signed: None,
             },
             SolizoneTransaction {
                 sender,
@@ -1366,6 +1626,7 @@ mod tests {
                 value: U256::from(200),
                 data: Bytes::new(),
                 gas_limit: 21_000,
+                signed: None,
             },
         ];
 
@@ -1446,6 +1707,7 @@ mod tests {
             value: U256::from(100),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let outcome_0 = engine.execute_block(&mut state, &block_0_transactions);
@@ -1479,6 +1741,7 @@ mod tests {
             value: U256::from(200),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let outcome_1 = engine.execute_block(&mut state, &block_1_transactions);

@@ -4,14 +4,36 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-lb-zone-sdk = { package = "logos-blockchain-zone-sdk", path = "../../logos-blockchain-basecamp-compat/zone-sdk" }
-lb-key-management-system-service = { package = "logos-blockchain-key-management-system-service", path = "../../logos-blockchain-basecamp-compat/services/key-management-system" }
-lb-groth16 = { package = "logos-blockchain-groth16", path = "../../logos-blockchain-basecamp-compat/zk/groth16" }
+# Logos Zone SDK pinned to the upstream commit matching the Basecamp-compatible
+# checkout this was developed against (FundingConfig has priority_fee_percent,
+# no change_pk). Previously a local path: ../../logos-blockchain-basecamp-compat
+lb-zone-sdk = { package = "logos-blockchain-zone-sdk", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "3d09ad6815b9cc1754826597cde962199327c35c" }
+lb-key-management-system-service = { package = "logos-blockchain-key-management-system-service", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "3d09ad6815b9cc1754826597cde962199327c35c" }
+lb-groth16 = { package = "logos-blockchain-groth16", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "3d09ad6815b9cc1754826597cde962199327c35c" }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4.3"
 revm = "43.0.2"
 revm-bytecode = "43.0.0"
 serde = { version = "1", features = ["derive"] }
+
+# Ethereum transaction decoding, signature recovery and JSON-RPC types
+alloy-consensus = { version = "2.5.0", features = ["k256", "serde"] }
+alloy-eips = "2.5.0"
+alloy-rpc-types-eth = "2.5.0"
+alloy-primitives = "1.7.3"
+jsonrpsee = { version = "0.26.1", features = ["server", "macros"] }
 # storage-bindings = { git = "https://github.com/logos-storage/storage-rust-bindings", rev = "71aa3fe896c0dae5bd587964e6b4943cdb1245f0" }
+
+[dev-dependencies]
+alloy-signer = "2.5.0"
+alloy-signer-local = "2.5.0"
+jsonrpsee = { version = "0.26.1", features = ["http-client"] }

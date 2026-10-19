@@ -4,7 +4,14 @@ use revm::primitives::{B256, keccak256};
 
 pub const HEADER_SIZE: usize = 170;
 
+/// Block containing only internal (SZT1) transactions.
 const BLOCK_MAGIC: &[u8; 4] = b"SZB1";
+
+/// Block containing at least one signed Ethereum (SZT2) transaction.
+/// Same layout as SZB1; the magic tells older decoders the body has
+/// entries they cannot read. Internal-only blocks keep encoding as SZB1,
+/// so existing history stays byte-identical.
+const SIGNED_BLOCK_MAGIC: &[u8; 4] = b"SZB2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolizoneBlock {
@@ -15,12 +22,18 @@ pub struct SolizoneBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockValidationError {
     TransactionsRootMismatch,
+    /// A signed transaction was signed for a different chain than the block.
+    TransactionChainIdMismatch {
+        index: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockDecodeError {
     UnexpectedEof,
     InvalidMagic,
+    /// An SZB1 block contained a signed (SZT2) transaction.
+    SignedTransactionInLegacyBlock,
     InvalidHeaderLength,
     TransactionDecode,
     TrailingBytes,
@@ -36,7 +49,11 @@ impl SolizoneBlock {
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
-        bytes.extend_from_slice(BLOCK_MAGIC);
+        if self.has_signed_transactions() {
+            bytes.extend_from_slice(SIGNED_BLOCK_MAGIC);
+        } else {
+            bytes.extend_from_slice(BLOCK_MAGIC);
+        }
 
         bytes.extend_from_slice(&self.header.encode());
 
@@ -65,9 +82,25 @@ impl SolizoneBlock {
         compute_transactions_root(&self.transactions) == self.header.transactions_root
     }
 
+    pub fn has_signed_transactions(&self) -> bool {
+        self.transactions.iter().any(|tx| tx.is_signed())
+    }
+
     pub fn validate(&self) -> Result<(), BlockValidationError> {
         if !self.validate_transactions_root() {
             return Err(BlockValidationError::TransactionsRootMismatch);
+        }
+
+        for (index, tx) in self.transactions.iter().enumerate() {
+            if let Some(raw) = &tx.signed {
+                let chain_id = crate::eth::SignedEthTransaction::decode(raw)
+                    .map(|signed| signed.chain_id())
+                    .ok();
+
+                if chain_id != Some(self.header.chain_id) {
+                    return Err(BlockValidationError::TransactionChainIdMismatch { index });
+                }
+            }
         }
 
         Ok(())
@@ -81,9 +114,13 @@ impl SolizoneBlock {
          */
         let magic = take(&mut input, 4)?;
 
-        if magic != BLOCK_MAGIC {
+        let signed_block = if magic == SIGNED_BLOCK_MAGIC {
+            true
+        } else if magic == BLOCK_MAGIC {
+            false
+        } else {
             return Err(BlockDecodeError::InvalidMagic);
-        }
+        };
 
         /*
          * Header
@@ -109,6 +146,10 @@ impl SolizoneBlock {
 
             let tx = SolizoneTransaction::decode_canonical(tx_bytes)
                 .map_err(|_| BlockDecodeError::TransactionDecode)?;
+
+            if tx.is_signed() && !signed_block {
+                return Err(BlockDecodeError::SignedTransactionInLegacyBlock);
+            }
 
             transactions.push(tx);
         }
@@ -230,5 +271,96 @@ impl SolizoneBlockHeader {
             gas_limit,
             gas_used,
         })
+    }
+}
+
+#[cfg(test)]
+mod signed_block_tests {
+    use super::*;
+    use crate::block_builder::build_block;
+    use crate::eth::SignedEthTransaction;
+    use crate::eth::test_utils::{TxParams, dev_signer, sign_eip1559};
+    use crate::execution::transaction::TransactionKind;
+    use revm::primitives::{Bytes, U256, address};
+
+    fn internal_tx() -> SolizoneTransaction {
+        SolizoneTransaction {
+            sender: address!("1111111111111111111111111111111111111111"),
+            nonce: 0,
+            kind: TransactionKind::Call(address!("2222222222222222222222222222222222222222")),
+            value: U256::from(1),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+            signed: None,
+        }
+    }
+
+    fn signed_tx(chain_id: u64) -> SolizoneTransaction {
+        let raw = sign_eip1559(
+            &dev_signer(0),
+            TxParams::transfer(
+                chain_id,
+                0,
+                address!("2222222222222222222222222222222222222222"),
+                5,
+            ),
+        );
+        SignedEthTransaction::decode(&raw).unwrap().to_solizone()
+    }
+
+    fn block(chain_id: u64, txs: Vec<SolizoneTransaction>) -> SolizoneBlock {
+        build_block(
+            1,
+            chain_id,
+            3,
+            B256::ZERO,
+            1_800_000_000,
+            B256::ZERO,
+            &txs,
+            &[],
+            30_000_000,
+        )
+    }
+
+    #[test]
+    fn internal_only_blocks_stay_szb1() {
+        let block = block(9001, vec![internal_tx()]);
+        let bytes = block.encode();
+
+        assert_eq!(&bytes[..4], b"SZB1");
+        assert_eq!(SolizoneBlock::decode_and_validate(&bytes).unwrap(), block);
+    }
+
+    #[test]
+    fn signed_blocks_round_trip_as_szb2() {
+        let block = block(9001, vec![internal_tx(), signed_tx(9001)]);
+        let bytes = block.encode();
+
+        assert_eq!(&bytes[..4], b"SZB2");
+
+        let decoded = SolizoneBlock::decode_and_validate(&bytes).unwrap();
+        assert_eq!(decoded, block);
+        assert!(decoded.transactions[1].is_signed());
+    }
+
+    #[test]
+    fn szb1_block_cannot_smuggle_signed_transactions() {
+        let mut bytes = block(9001, vec![signed_tx(9001)]).encode();
+        bytes[..4].copy_from_slice(b"SZB1");
+
+        assert_eq!(
+            SolizoneBlock::decode(&bytes).unwrap_err(),
+            BlockDecodeError::SignedTransactionInLegacyBlock
+        );
+    }
+
+    #[test]
+    fn rejects_signed_transaction_for_another_chain() {
+        let block = block(9001, vec![signed_tx(1)]);
+
+        assert_eq!(
+            block.validate(),
+            Err(BlockValidationError::TransactionChainIdMismatch { index: 0 })
+        );
     }
 }

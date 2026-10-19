@@ -282,29 +282,56 @@ The Storage layer stores and retrieves content. It does **not** decide which Sol
 Run:
 
 ```bash
+# Logos Storage backed (needs Basecamp + logosctl)
 cargo run --bin solizone_node
+
+# Local disk only: no Basecamp needed (local development, Zoner)
+cargo run --bin solizone_node -- --storage local
 ```
+
+Flags:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--storage logos\|local` | `logos` | where blocks and checkpoints are persisted |
+| `--rpc ADDR` | `127.0.0.1:8545` | JSON-RPC listen address |
+| `--block-time SECONDS` | `2` | how often pending transactions are sealed into a block |
+| `--retention BLOCKS` | `64` | recent blocks kept locally before archiving (logos mode) |
+| `--data-dir DIR` | current dir | where node data lives |
+| `reset` | | delete the node data for the selected storage mode |
 
 The runtime continuously owns:
 
 ```text
-MemoryState
+NodeCore  (MemoryState + pending state + BlockProducer + mempool + tx index)
 +
-BlockProducer
+NodeStorage
+  ├── logos: HybridBlockStore + LogosStorageCheckpointBackend
+  └── local: FileBlockStore   + FileCheckpointBackend
 +
-HybridBlockStore
-+
-LogosStorageCheckpointBackend
+JSON-RPC server (jsonrpsee)
 ```
+
+Core and storage sit behind separate locks that are never held together,
+so a slow Logos Storage upload never blocks RPC reads or transaction
+submission. If persistence fails, block production halts instead of letting
+in-memory state drift from durable state.
 
 Runtime flow:
 
 ```text
-execute transaction
+eth_sendRawTransaction
       ↓
+decode EIP-2718 + recover sender + check chain id
+      ↓
+dry-run against pending state (nonce, funds, gas)
+      ↓
+Solizone mempool (FIFO)
+      ↓
+every --block-time, if transactions are pending:
 produce block
       ↓
-insert into HybridBlockStore
+insert into block storage
       ↓
 archive / prune old history if needed
       ↓
@@ -315,7 +342,10 @@ persist checkpoint to Logos Storage
 continue
 ```
 
-If no checkpoint exists, the node starts fresh.
+If no checkpoint exists, the node starts a fresh chain: it funds the five
+standard Foundry/Anvil dev accounts with 10,000 ETH each and persists an
+empty genesis block #0 (Ethereum tooling expects a `latest` block). The dev
+private keys are public; use them for local development only.
 
 If a previous checkpoint exists:
 
@@ -334,6 +364,73 @@ continue block production
 ```
 
 A full restart path has been verified with the node stopping at one height and continuing the same parent-linked chain from the next height after recovery.
+
+---
+
+## Ethereum JSON-RPC
+
+Standard Ethereum tooling (Foundry, viem, ethers, wallets) talks to the node
+directly:
+
+```bash
+cargo run --bin solizone_node -- --storage local
+
+forge create contracts/Counter.sol:Counter --broadcast \
+  --rpc-url http://127.0.0.1:8545 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+
+cast send <counter> "increment()" --rpc-url http://127.0.0.1:8545 --private-key 0xac09…ff80
+cast call <counter> "count()(uint256)" --rpc-url http://127.0.0.1:8545
+```
+
+`scripts/foundry-smoke.sh` runs that whole flow against a running node.
+
+Chain id is `9001`. Supported methods:
+
+```text
+web3_clientVersion  net_version  net_listening
+eth_chainId  eth_blockNumber  eth_syncing  eth_accounts
+eth_gasPrice  eth_maxPriorityFeePerGas  eth_feeHistory
+eth_getBalance  eth_getTransactionCount  eth_getCode  eth_getStorageAt
+eth_call  eth_estimateGas
+eth_sendRawTransaction  eth_getTransactionByHash  eth_getTransactionReceipt
+eth_getBlockByNumber  eth_getBlockByHash  eth_getLogs
+```
+
+Behaviour worth knowing:
+
+- Legacy (EIP-155 only), EIP-2930 and EIP-1559 transactions are accepted.
+  Blob (EIP-4844) and set-code (EIP-7702) transactions are rejected.
+- Fees are not charged yet: gas price, base fee and priority fee are all 0.
+- Per-transaction gas is capped at 16,777,216 (EIP-7825, REVM's Osaka spec);
+  the block gas limit is 30,000,000.
+- Reverts return error code `3` with the revert data and decoded
+  `Error(string)` reason, so Foundry shows readable messages.
+- Only the latest state is kept: state queries accept `latest`, `pending`
+  and the head block; older block numbers return an error.
+- Blocks are produced only when transactions are pending, so the chain does
+  not grow while idle.
+
+### Signed transactions in blocks (SZT2 / SZB2)
+
+Transactions submitted through JSON-RPC are stored in blocks as their exact
+signed EIP-2718 bytes:
+
+```text
+SZT1 | internal fields             internal transaction (no signature)
+SZT2 | raw signed EIP-2718 bytes   Ethereum transaction
+```
+
+On decode, every execution field of an SZT2 transaction (sender, nonce,
+target, value, data, gas) is re-derived from the signed bytes, so a stored
+block can never carry fields that disagree with its signatures. The
+transactions root commits to the SZT2 bytes, i.e. to the signatures.
+
+A block containing any SZT2 transaction is encoded with the `SZB2` magic;
+blocks with only internal transactions remain byte-identical `SZB1`, so
+existing history keeps decoding and hashing exactly as before. Block
+validation also checks that every signed transaction's chain id matches the
+block header.
 
 ---
 
@@ -491,12 +588,15 @@ BlockStore
 
 Not implemented yet:
 
-- raw signed Ethereum transactions
-- EIP-2718 / RLP decoding
-- secp256k1 sender recovery
-- Ethereum fee handling
-- transaction pool
-- Ethereum JSON-RPC
+- Ethereum fee handling (all fees are zero)
+- fee-based transaction replacement in the mempool
+- historical state queries (only latest / pending state is kept)
+- transaction receipts and the tx-hash index survive only in memory: after
+  a restart, blocks are served from storage but receipts for transactions
+  from before the restart return null
+- publishing produced blocks to Logos from `solizone_node` (still the
+  separate `publish` harness)
+- WebSocket subscriptions and CORS for browser clients
 - full imported-block re-execution validation
 - Ethereum MPT state roots
 - network-distributed canonical head / CID discovery
@@ -511,41 +611,24 @@ These are intentionally deferred to the next development phase.
 
 ## Next development steps
 
-### 1. Raw Ethereum transaction ingestion
+### Done: raw transactions, mempool, JSON-RPC
 
-```text
-signed Ethereum transaction
-        ↓
-decode transaction envelope
-        ↓
-recover sender
-        ↓
-admission validation
-        ↓
-Solizone transaction
-```
+Signed Ethereum transactions, the Solizone mempool and the Ethereum JSON-RPC
+surface are implemented (see [Ethereum JSON-RPC](#ethereum-json-rpc)).
 
-### 2. Transaction pool
+### 1. Persist receipts and the transaction index
 
-```text
-incoming transactions
-        ↓
-Solizone mempool
-        ↓
-BlockProducer
-        ↓
-REVM
-```
+So `eth_getTransactionReceipt` and `eth_getLogs` keep working across
+restarts.
 
-### 3. Ethereum-compatible JSON-RPC
+### 2. Durable Logos publisher inside the node
 
-```text
-Foundry / MetaMask / ethers / viem
-        ↓
-Ethereum JSON-RPC
-        ↓
-Solizone node
-```
+Queue produced blocks and publish them through the Zone SDK from
+`solizone_node`, tracking inclusion and finality.
+
+### 3. Zoner
+
+Developer toolkit (build, test, deploy) on top of the JSON-RPC surface.
 
 ### 4. Independent block validation
 

@@ -1,337 +1,284 @@
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+//! Long-running Solizone node with an Ethereum JSON-RPC endpoint.
+//!
+//! ```text
+//! cargo run --bin solizone_node -- [--storage logos|local] [--rpc 127.0.0.1:8545]
+//!                                  [--block-time 2] [--retention 64] [--data-dir .]
+//! cargo run --bin solizone_node -- reset [--storage logos|local] [--data-dir .]
+//! ```
+//!
+//! `--storage logos` (default) keeps recent blocks locally, archives older
+//! blocks and every checkpoint to Logos Storage through `logosctl`.
+//! `--storage local` keeps everything on local disk: no Basecamp needed,
+//! which is what local development and Zoner use.
 
-use revm::{
-    primitives::{Bytes, U256, address},
-    state::AccountInfo,
-};
+use std::{env, fs, net::SocketAddr, path::PathBuf, time::Duration};
+
+use revm::primitives::{Address, U256};
 
 use solizone_evm::{
-    block_producer::BlockProducer,
-    block_store::BlockStore,
-    execution::{
-        RevmExecutionEngine,
-        transaction::{SolizoneTransaction, TransactionKind},
-    },
+    file_block_store::FileBlockStore,
     hybrid_block_store::HybridBlockStore,
-    state::{CheckpointBackend, LogosStorageCheckpointBackend, MemoryState, SolizoneCheckpoint},
+    node::{
+        ChainStorage, NodeConfig, NodeCore, NodeHandle, NodeStorage,
+        dev_accounts::{DEV_ACCOUNTS, dev_account_balance},
+        runtime::unix_now,
+    },
+    rpc,
+    state::{FileCheckpointBackend, LogosStorageCheckpointBackend},
 };
 
-const VERSION: u16 = 1;
-const CHAIN_ID: u64 = 9001;
-const GAS_LIMIT: u64 = 30_000_000;
-
-const RETENTION_WINDOW: usize = 3;
-
-const BLOCK_INTERVAL_SECONDS: u64 = 5;
-
-struct NodePaths {
-    blocks: PathBuf,
-    archive_index: PathBuf,
-    recovery: PathBuf,
-    archive_work: PathBuf,
-    checkpoint_work: PathBuf,
-    checkpoint_cid: PathBuf,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageMode {
+    Logos,
+    Local,
 }
 
-fn main() -> Result<(), String> {
-    let root = env::current_dir().map_err(|error| error.to_string())?;
+struct Options {
+    reset: bool,
+    storage: StorageMode,
+    rpc: SocketAddr,
+    block_time: Duration,
+    retention: usize,
+    data_dir: PathBuf,
+}
 
-    let paths = NodePaths {
-        blocks: root.join("solizone-node-blocks"),
+fn usage() -> String {
+    "usage: solizone_node [reset] [--storage logos|local] [--rpc ADDR] \
+     [--block-time SECONDS] [--retention BLOCKS] [--data-dir DIR]"
+        .to_string()
+}
 
-        archive_index: root.join("solizone-node-archive-index.json"),
-
-        recovery: root.join("solizone-node-recovery"),
-
-        archive_work: root.join("solizone-node-archive-work"),
-
-        checkpoint_work: root.join("solizone-node-checkpoint-work"),
-
-        checkpoint_cid: root.join("solizone-node-latest-checkpoint.cid"),
+fn parse_options() -> Result<Options, String> {
+    let mut options = Options {
+        reset: false,
+        storage: StorageMode::Logos,
+        rpc: "127.0.0.1:8545".parse().expect("valid default address"),
+        block_time: Duration::from_secs(2),
+        retention: 64,
+        data_dir: env::current_dir().map_err(|error| error.to_string())?,
     };
 
-    /*
-     * Optional demo reset:
-     *
-     * cargo run --bin solizone_node -- reset
-     */
+    let mut args = env::args().skip(1);
 
-    if env::args().nth(1).as_deref() == Some("reset") {
-        reset_node(&paths)?;
+    while let Some(arg) = args.next() {
+        let mut value = |name: &str| {
+            args.next()
+                .ok_or_else(|| format!("{name} needs a value\n{}", usage()))
+        };
 
-        println!("Solizone node demo state reset");
-
-        return Ok(());
+        match arg.as_str() {
+            "reset" => options.reset = true,
+            "--storage" => {
+                options.storage = match value("--storage")?.as_str() {
+                    "logos" => StorageMode::Logos,
+                    "local" => StorageMode::Local,
+                    other => return Err(format!("unknown storage mode {other:?}\n{}", usage())),
+                }
+            }
+            "--rpc" => {
+                options.rpc = value("--rpc")?
+                    .parse()
+                    .map_err(|error| format!("invalid --rpc address: {error}"))?
+            }
+            "--block-time" => {
+                let seconds: f64 = value("--block-time")?
+                    .parse()
+                    .map_err(|error| format!("invalid --block-time: {error}"))?;
+                if !seconds.is_finite() || seconds <= 0.0 {
+                    return Err("--block-time must be positive".to_string());
+                }
+                options.block_time = Duration::from_secs_f64(seconds);
+            }
+            "--retention" => {
+                options.retention = value("--retention")?
+                    .parse()
+                    .map_err(|error| format!("invalid --retention: {error}"))?
+            }
+            "--data-dir" => options.data_dir = PathBuf::from(value("--data-dir")?),
+            "-h" | "--help" => return Err(usage()),
+            other => return Err(format!("unknown argument {other:?}\n{}", usage())),
+        }
     }
 
-    run_node(paths)
+    Ok(options)
 }
 
-fn run_node(paths: NodePaths) -> Result<(), String> {
-    fs::create_dir_all(&paths.blocks).map_err(|error| error.to_string())?;
+/// On-disk layout. Logos mode keeps the original `solizone-node-*` paths so
+/// existing node data keeps working; local mode lives in its own directory.
+struct NodePaths {
+    root: PathBuf,
+    mode: StorageMode,
+}
 
-    fs::create_dir_all(&paths.recovery).map_err(|error| error.to_string())?;
+impl NodePaths {
+    fn logos(&self, name: &str) -> PathBuf {
+        self.root.join(format!("solizone-node-{name}"))
+    }
 
-    fs::create_dir_all(&paths.archive_work).map_err(|error| error.to_string())?;
+    fn local_root(&self) -> PathBuf {
+        self.root.join("solizone-node-local")
+    }
 
-    fs::create_dir_all(&paths.checkpoint_work).map_err(|error| error.to_string())?;
+    fn owned_paths(&self) -> Vec<PathBuf> {
+        match self.mode {
+            StorageMode::Logos => [
+                "blocks",
+                "archive-index.json",
+                "recovery",
+                "archive-work",
+                "checkpoint-work",
+                "latest-checkpoint.cid",
+            ]
+            .iter()
+            .map(|name| self.logos(name))
+            .collect(),
+            StorageMode::Local => vec![self.local_root()],
+        }
+    }
+}
 
-    let checkpoint_backend =
-        LogosStorageCheckpointBackend::new(&paths.checkpoint_work, &paths.checkpoint_cid);
+fn open_storage(paths: &NodePaths, retention: usize) -> Result<Box<dyn NodeStorage>, String> {
+    match paths.mode {
+        StorageMode::Logos => {
+            for name in ["blocks", "recovery", "archive-work", "checkpoint-work"] {
+                fs::create_dir_all(paths.logos(name)).map_err(|error| error.to_string())?;
+            }
 
-    let sender = address!("1111111111111111111111111111111111111111");
+            Ok(Box::new(ChainStorage::new(
+                HybridBlockStore::new(
+                    paths.logos("blocks"),
+                    paths.logos("archive-index.json"),
+                    paths.logos("recovery"),
+                    paths.logos("archive-work"),
+                    retention,
+                ),
+                LogosStorageCheckpointBackend::new(
+                    paths.logos("checkpoint-work"),
+                    paths.logos("latest-checkpoint.cid"),
+                ),
+            )))
+        }
+        StorageMode::Local => {
+            let root = paths.local_root();
+            fs::create_dir_all(root.join("blocks")).map_err(|error| error.to_string())?;
 
-    let recipient = address!("2222222222222222222222222222222222222222");
+            Ok(Box::new(ChainStorage::new(
+                FileBlockStore::new(root.join("blocks")),
+                FileCheckpointBackend::new(root.join("checkpoint.json")),
+            )))
+        }
+    }
+}
 
-    /*
-     * STARTUP:
-     *
-     * Automatically decide whether this is
-     * a new node or a restart.
-     */
+fn reset(paths: &NodePaths) -> Result<(), String> {
+    for path in paths.owned_paths() {
+        if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else if path.exists() {
+            fs::remove_file(&path)
+        } else {
+            Ok(())
+        }
+        .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
+    }
 
-    let (mut state, mut producer) = if paths.checkpoint_cid.exists() {
-        println!("\n========================================");
+    Ok(())
+}
 
-        println!("Existing Solizone checkpoint detected");
+/// Recovers from the latest checkpoint, or starts a fresh dev chain.
+fn bootstrap(config: NodeConfig, storage: &mut dyn NodeStorage) -> Result<NodeCore, String> {
+    if let Some(checkpoint) = storage.load_checkpoint()? {
+        let head_height = checkpoint
+            .next_height
+            .checked_sub(1)
+            .ok_or("checkpoint has no produced blocks")?;
 
-        println!("Recovering node from Logos Storage...");
+        let head = storage
+            .block_by_height(head_height)?
+            .ok_or_else(|| format!("chain-head block #{head_height} missing from storage"))?;
 
-        println!("========================================\n");
-
-        let checkpoint = checkpoint_backend.load()?.ok_or_else(|| {
-            "checkpoint CID exists but checkpoint could not be loaded".to_string()
-        })?;
-
-        let next_height = checkpoint.next_height;
-
-        let parent_hash = checkpoint.parent_hash;
-
-        let state = MemoryState::from_snapshot(checkpoint.state);
-
-        let producer =
-            BlockProducer::resume(VERSION, CHAIN_ID, GAS_LIMIT, next_height, parent_hash);
-
-        println!("Node recovery complete");
-
-        println!("Recovered next height: {}", next_height,);
-
-        println!("Recovered parent hash: {}", parent_hash,);
-
-        (state, producer)
-    } else {
-        println!("\n========================================");
-
-        println!("No checkpoint found");
-
-        println!("Starting fresh Solizone node");
-
-        println!("========================================\n");
-
-        let mut state = MemoryState::new();
-
-        /*
-         * Large balance so the demo can
-         * continue producing transactions.
-         */
-
-        state.insert_account_info(
-            sender,
-            AccountInfo::from_balance(U256::from(1_000_000_000u64)),
-        );
-
-        let producer = BlockProducer::new(VERSION, CHAIN_ID, GAS_LIMIT);
-
-        (state, producer)
-    };
-
-    let mut block_store = HybridBlockStore::new(
-        &paths.blocks,
-        &paths.archive_index,
-        &paths.recovery,
-        &paths.archive_work,
-        RETENTION_WINDOW,
-    );
-
-    /*
-     * If this is a restart, verify that
-     * our recovered chain head agrees
-     * with stored block history.
-     */
-
-    if producer.next_height() > 0 {
-        let previous_height = producer.next_height() - 1;
-
-        let previous_block = block_store
-            .get_by_height(previous_height)?
-            .ok_or_else(|| format!("chain-head block #{previous_height} missing"))?;
-
-        if previous_block.hash() != producer.parent_hash() {
+        if head.hash() != checkpoint.parent_hash {
             return Err("checkpoint parent hash does not match stored chain head".to_string());
         }
 
-        println!("Chain-head verification passed");
+        println!("Recovered node at block #{head_height} ({})", head.hash());
 
-        println!("Head block: #{}", previous_height,);
+        return Ok(NodeCore::resume(config, checkpoint, Some(head)));
+    }
 
-        println!("Head hash:  {}", previous_block.hash(),);
+    let genesis: Vec<(Address, U256)> = DEV_ACCOUNTS
+        .iter()
+        .map(|account| (account.address, dev_account_balance()))
+        .collect();
+
+    let (core, genesis_commit) = NodeCore::new(config, &genesis, unix_now());
+
+    storage.persist(genesis_commit.block, &genesis_commit.checkpoint)?;
+
+    println!("Started fresh chain; genesis block #0 persisted");
+    println!();
+    println!("Dev accounts (10,000 ETH each; PUBLIC test keys, local use only):");
+
+    for (index, account) in DEV_ACCOUNTS.iter().enumerate() {
+        println!("  ({index}) {}  {}", account.address, account.private_key);
+    }
+
+    Ok(core)
+}
+
+fn main() -> Result<(), String> {
+    let options = parse_options()?;
+
+    let paths = NodePaths {
+        root: options.data_dir.clone(),
+        mode: options.storage,
+    };
+
+    if options.reset {
+        reset(&paths)?;
+        println!("Solizone node state reset ({:?} storage)", options.storage);
+        return Ok(());
+    }
+
+    let config = NodeConfig::default();
+    let chain_id = config.chain_id;
+
+    let mut storage = open_storage(&paths, options.retention)?;
+    let core = bootstrap(config, storage.as_mut())?;
+    let head = core.head_height().unwrap_or(0);
+
+    let node = NodeHandle::new(core, storage);
+
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+
+    runtime.block_on(async move {
+        let (address, server) = rpc::start_server(node.clone(), options.rpc).await?;
 
         println!();
-    }
-
-    let engine = RevmExecutionEngine::new();
-
-    println!("Solizone node is running");
-
-    println!("Block interval: {} seconds", BLOCK_INTERVAL_SECONDS,);
-
-    println!("Local retention window: {} blocks", RETENTION_WINDOW,);
-
-    println!("Press Ctrl+C after a completed checkpoint to stop the demo.");
-
-    println!();
-
-    /*
-     * LONG-RUNNING NODE LOOP
-     */
-
-    loop {
-        let height = producer.next_height();
-
-        /*
-         * One deterministic transfer per block.
-         *
-         * Because every produced block contains
-         * exactly one sender transaction:
-         *
-         * transaction nonce == block height.
-         */
-
-        let transactions = vec![SolizoneTransaction {
-            sender,
-
-            nonce: height,
-
-            kind: TransactionKind::Call(recipient),
-
-            value: U256::from(100),
-
-            data: Bytes::new(),
-
-            gas_limit: 21_000,
-        }];
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("system clock error: {error}"))?
-            .as_secs();
-
-        let block = producer.produce_block(&engine, &mut state, &transactions, timestamp);
-
-        block
-            .validate()
-            .map_err(|error| format!("block #{height} failed validation: {error:?}"))?;
-
-        let block_hash = block.hash();
-
-        let parent_hash = block.header.parent_hash;
-
-        /*
-         * HybridBlockStore automatically:
-         *
-         * 1. persists block locally
-         * 2. checks retention
-         * 3. archives oldest block if needed
-         * 4. records CID
-         * 5. prunes old local .szb
-         */
-
-        block_store.insert(block)?;
-
-        /*
-         * Persist current EVM state +
-         * new chain head to Logos Storage.
-         */
-
-        let checkpoint = SolizoneCheckpoint::new(
-            state.snapshot(),
-            producer.next_height(),
-            producer.parent_hash(),
+        println!("Solizone node running");
+        println!("  chain id:   {chain_id}");
+        println!("  head block: #{head}");
+        println!(
+            "  storage:    {:?} ({})",
+            options.storage,
+            options.data_dir.display()
         );
+        println!(
+            "  block time: {:?} (blocks are produced only when transactions are pending)",
+            options.block_time
+        );
+        println!("  JSON-RPC:   http://{address}");
+        println!();
 
-        checkpoint_backend.save(&checkpoint)?;
+        node.spawn_block_producer(options.block_time);
 
-        /*
-         * Demo-friendly status output.
-         */
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| format!("failed to listen for Ctrl+C: {error}"))?;
 
-        println!("\n----------------------------------------");
+        println!("\nShutting down");
+        let _ = server.stop();
 
-        println!("Produced block #{}", height,);
-
-        println!("Block hash:  {}", block_hash,);
-
-        println!("Parent hash: {}", parent_hash,);
-
-        println!("State root:  {}", state.state_root(),);
-
-        println!("Local blocks:    {}", block_store.local_len()?,);
-
-        println!("Archived blocks: {}", block_store.archived_len()?,);
-
-        println!("Total history:   {}", block_store.len()?,);
-
-        println!("Next height:     {}", producer.next_height(),);
-
-        println!("Checkpoint:      Logos Storage validated");
-
-        println!("----------------------------------------\n");
-
-        /*
-         * This makes continuous production
-         * visually clear in the video.
-         */
-
-        thread::sleep(Duration::from_secs(BLOCK_INTERVAL_SECONDS));
-    }
-}
-
-fn reset_node(paths: &NodePaths) -> Result<(), String> {
-    for directory in [
-        &paths.blocks,
-        &paths.recovery,
-        &paths.archive_work,
-        &paths.checkpoint_work,
-    ] {
-        remove_directory_if_exists(directory)?;
-    }
-
-    remove_file_if_exists(&paths.archive_index)?;
-
-    remove_file_if_exists(&paths.checkpoint_cid)?;
-
-    Ok(())
-}
-
-fn remove_directory_if_exists(path: &Path) -> Result<(), String> {
-    if path.exists() {
-        fs::remove_dir_all(path)
-            .map_err(|error| format!("failed to remove {}: {error}", path.display(),))?;
-    }
-
-    Ok(())
-}
-
-fn remove_file_if_exists(path: &Path) -> Result<(), String> {
-    if path.exists() {
-        fs::remove_file(path)
-            .map_err(|error| format!("failed to remove {}: {error}", path.display(),))?;
-    }
-
-    Ok(())
+        Ok::<(), String>(())
+    })
 }

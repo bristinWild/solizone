@@ -99,6 +99,7 @@ fn process_a() -> Result<(), String> {
             value: U256::from(100),
             data: Bytes::new(),
             gas_limit: 21_000,
+            signed: None,
         }];
 
         let block =
@@ -300,6 +301,7 @@ fn process_b() -> Result<(), String> {
         value: U256::from(100),
         data: Bytes::new(),
         gas_limit: 21_000,
+        signed: None,
     }];
 
     let block_5 = producer.produce_block(&engine, &mut state, &transactions, 1_800_000_005);

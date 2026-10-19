@@ -1,6 +1,11 @@
 use revm::primitives::{Address, B256, Bytes, U256, keccak256};
 
+/// Internal deterministic envelope: fields encoded directly, no signature.
 const TX_MAGIC: &[u8; 4] = b"SZT1";
+
+/// Signed Ethereum transaction: magic followed by the exact EIP-2718 bytes.
+/// All execution fields are re-derived from the signed bytes on decode.
+const SIGNED_TX_MAGIC: &[u8; 4] = b"SZT2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionKind {
@@ -16,6 +21,9 @@ pub struct SolizoneTransaction {
     pub value: U256,
     pub data: Bytes,
     pub gas_limit: u64,
+    /// Raw signed EIP-2718 bytes when the transaction came from Ethereum
+    /// tooling (`eth_sendRawTransaction`); `None` for internal transactions.
+    pub signed: Option<Bytes>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +31,7 @@ pub enum TransactionDecodeError {
     UnexpectedEof,
     InvalidMagic,
     InvalidKind(u8),
+    InvalidSignedTransaction(String),
     TrailingBytes,
 }
 
@@ -40,6 +49,14 @@ fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8], TransactionDec
 impl SolizoneTransaction {
     pub fn encode_canonical(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+
+        if let Some(raw) = &self.signed {
+            bytes.extend_from_slice(SIGNED_TX_MAGIC);
+
+            bytes.extend_from_slice(raw.as_ref());
+
+            return bytes;
+        }
 
         bytes.extend_from_slice(TX_MAGIC);
 
@@ -80,14 +97,33 @@ impl SolizoneTransaction {
         }
     }
 
+    /// Solizone commitment hash (keccak256 of the canonical SZT encoding).
+    /// Used for the transactions root; differs from the Ethereum tx hash.
     pub fn hash(&self) -> B256 {
         keccak256(self.encode_canonical())
+    }
+
+    /// Standard Ethereum transaction hash for signed transactions.
+    pub fn eth_hash(&self) -> Option<B256> {
+        self.signed.as_ref().map(keccak256)
+    }
+
+    pub fn is_signed(&self) -> bool {
+        self.signed.is_some()
     }
 
     pub fn decode_canonical(bytes: &[u8]) -> Result<Self, TransactionDecodeError> {
         let mut input = bytes;
 
         let magic = take(&mut input, 4)?;
+
+        if magic == SIGNED_TX_MAGIC {
+            return crate::eth::SignedEthTransaction::decode(input)
+                .map(|tx| tx.to_solizone())
+                .map_err(|error| {
+                    TransactionDecodeError::InvalidSignedTransaction(error.to_string())
+                });
+        }
 
         if magic != TX_MAGIC {
             return Err(TransactionDecodeError::InvalidMagic);
@@ -132,6 +168,7 @@ impl SolizoneTransaction {
             value,
             data,
             gas_limit,
+            signed: None,
         })
     }
 }

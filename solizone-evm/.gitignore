@@ -2,8 +2,6 @@
 /Cargo.lock
 /contracts-out
 /cache
-/contracts/Counter.creation.hex
-/contracts/Counter.runtime.hex
 /.state/
 /storage-data
 solizone-config.json
@@ -27,3 +25,5 @@ hybrid-trait-recovery
 hybrid-block-recovery
 hybrid-auto-recovery
 hybrid-auto-blocks
+solizone-node-local
+solizone-node-local/
