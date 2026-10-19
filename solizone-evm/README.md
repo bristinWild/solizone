@@ -385,6 +385,11 @@ cast call <counter> "count()(uint256)" --rpc-url http://127.0.0.1:8545
 
 `scripts/foundry-smoke.sh` runs that whole flow against a running node.
 
+`scripts/foundry-contracts.sh` goes further with `contracts/Zoo.sol`: an ERC20 with
+constructor args and custom errors, CREATE/CREATE2 factories, a payable vault,
+external library linking, precompiles, environment opcodes, Panic reverts and
+call/delegatecall/staticcall between contracts (35 checks).
+
 Chain id is `9001`. Supported methods:
 
 ```text
