@@ -184,7 +184,7 @@ ordering / consensus / finality
 ## Next milestones
 
 1. ~~Raw signed Ethereum transactions, mempool, JSON-RPC, Foundry support.~~ Done.
-2. Persist receipts and the transaction index across restarts.
+2. ~~Persist receipts and the transaction index across restarts.~~ Done.
 3. Publish produced blocks to Logos from inside the node (durable publisher).
 4. Zoner: build / test / deploy toolkit on top of the JSON-RPC surface.
 5. Add independent block re-execution / validation.

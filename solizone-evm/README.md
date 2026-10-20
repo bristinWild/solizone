@@ -305,9 +305,9 @@ The runtime continuously owns:
 ```text
 NodeCore  (MemoryState + pending state + BlockProducer + mempool + tx index)
 +
-NodeStorage
-  ├── logos: HybridBlockStore + LogosStorageCheckpointBackend
-  └── local: FileBlockStore   + FileCheckpointBackend
+NodeStorage  (receipts, then block, then checkpoint)
+  ├── logos: HybridBlockStore + LogosStorageCheckpointBackend + FileReceiptStore
+  └── local: FileBlockStore   + FileCheckpointBackend         + FileReceiptStore
 +
 JSON-RPC server (jsonrpsee)
 ```
@@ -596,9 +596,11 @@ Not implemented yet:
 - Ethereum fee handling (all fees are zero)
 - fee-based transaction replacement in the mempool
 - historical state queries (only latest / pending state is kept)
-- transaction receipts and the tx-hash index survive only in memory: after
-  a restart, blocks are served from storage but receipts for transactions
-  from before the restart return null
+- the transaction index is rebuilt in memory from every stored receipt
+  record on startup (fine for development chains; very long chains would
+  need lazy loading)
+- receipts are kept on local disk, also in Logos mode; they are not yet
+  archived to Logos Storage
 - publishing produced blocks to Logos from `solizone_node` (still the
   separate `publish` harness)
 - WebSocket subscriptions and CORS for browser clients
@@ -621,21 +623,33 @@ These are intentionally deferred to the next development phase.
 Signed Ethereum transactions, the Solizone mempool and the Ethereum JSON-RPC
 surface are implemented (see [Ethereum JSON-RPC](#ethereum-json-rpc)).
 
-### 1. Persist receipts and the transaction index
+### Done: persistent receipts and transaction index
 
-So `eth_getTransactionReceipt` and `eth_getLogs` keep working across
-restarts.
+Every block's transactions and receipts are stored next to the block
+(`receipts/<height>.szrb`), written before the block and the checkpoint. On
+restart the node rebuilds its transaction index from them, so
+`eth_getTransactionReceipt`, `eth_getTransactionByHash`, `eth_getLogs` and
+block transaction lists keep working across restarts.
 
-### 2. Durable Logos publisher inside the node
+Receipts cannot be recomputed afterwards (that would need the state of every
+historical block), so a chain created before this change has no receipts for
+its old blocks. The node prints a warning and those old transactions return
+null; run `solizone_node reset` for a fresh chain.
+
+`scripts/foundry-restart.sh` tests this end to end with Foundry: it starts its
+own node, sends transactions, restarts the node on the same data and compares
+receipts, transactions, blocks and logs.
+
+### 1. Durable Logos publisher inside the node
 
 Queue produced blocks and publish them through the Zone SDK from
 `solizone_node`, tracking inclusion and finality.
 
-### 3. Zoner
+### 2. Zoner
 
 Developer toolkit (build, test, deploy) on top of the JSON-RPC surface.
 
-### 4. Independent block validation
+### 3. Independent block validation
 
 A second execution path should be able to consume canonical blocks, re-execute transactions, and independently verify resulting commitments.
 

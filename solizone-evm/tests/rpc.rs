@@ -55,7 +55,11 @@ async fn deploy_call_and_query_over_json_rpc() {
     let mut storage = MemoryNodeStorage::default();
     use solizone_evm::node::NodeStorage;
     storage
-        .persist(genesis_commit.block, &genesis_commit.checkpoint)
+        .persist(
+            genesis_commit.block,
+            &genesis_commit.receipts,
+            &genesis_commit.checkpoint,
+        )
         .unwrap();
 
     let node = NodeHandle::new(core, Box::new(storage));

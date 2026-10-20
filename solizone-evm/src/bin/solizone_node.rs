@@ -19,7 +19,7 @@ use solizone_evm::{
     file_block_store::FileBlockStore,
     hybrid_block_store::HybridBlockStore,
     node::{
-        ChainStorage, NodeConfig, NodeCore, NodeHandle, NodeStorage,
+        ChainStorage, FileReceiptStore, NodeConfig, NodeCore, NodeHandle, NodeStorage,
         dev_accounts::{DEV_ACCOUNTS, dev_account_balance},
         runtime::unix_now,
     },
@@ -128,6 +128,7 @@ impl NodePaths {
                 "archive-work",
                 "checkpoint-work",
                 "latest-checkpoint.cid",
+                "receipts",
             ]
             .iter()
             .map(|name| self.logos(name))
@@ -156,6 +157,8 @@ fn open_storage(paths: &NodePaths, retention: usize) -> Result<Box<dyn NodeStora
                     paths.logos("checkpoint-work"),
                     paths.logos("latest-checkpoint.cid"),
                 ),
+                // Receipts are derived data kept on local disk in both modes.
+                FileReceiptStore::new(paths.logos("receipts")),
             )))
         }
         StorageMode::Local => {
@@ -165,6 +168,7 @@ fn open_storage(paths: &NodePaths, retention: usize) -> Result<Box<dyn NodeStora
             Ok(Box::new(ChainStorage::new(
                 FileBlockStore::new(root.join("blocks")),
                 FileCheckpointBackend::new(root.join("checkpoint.json")),
+                FileReceiptStore::new(root.join("receipts")),
             )))
         }
     }
@@ -203,7 +207,31 @@ fn bootstrap(config: NodeConfig, storage: &mut dyn NodeStorage) -> Result<NodeCo
 
         println!("Recovered node at block #{head_height} ({})", head.hash());
 
-        return Ok(NodeCore::resume(config, checkpoint, Some(head)));
+        let mut core = NodeCore::resume(config, checkpoint, Some(head));
+
+        let mut records = Vec::new();
+        let mut missing = 0u64;
+
+        for height in 0..=head_height {
+            match storage.block_receipts(height)? {
+                Some(record) => records.push(record),
+                None => missing += 1,
+            }
+        }
+
+        let restored = core.restore_index(records);
+
+        println!("Restored transaction index for {restored} block(s)");
+
+        if missing > 0 {
+            eprintln!(
+                "warning: {missing} block(s) have no stored receipts (produced before receipts \
+                 were persisted); their transactions will not resolve over JSON-RPC. \
+                 Run `solizone_node reset` to start a fresh chain."
+            );
+        }
+
+        return Ok(core);
     }
 
     let genesis: Vec<(Address, U256)> = DEV_ACCOUNTS
@@ -213,7 +241,11 @@ fn bootstrap(config: NodeConfig, storage: &mut dyn NodeStorage) -> Result<NodeCo
 
     let (core, genesis_commit) = NodeCore::new(config, &genesis, unix_now());
 
-    storage.persist(genesis_commit.block, &genesis_commit.checkpoint)?;
+    storage.persist(
+        genesis_commit.block,
+        &genesis_commit.receipts,
+        &genesis_commit.checkpoint,
+    )?;
 
     println!("Started fresh chain; genesis block #0 persisted");
     println!();

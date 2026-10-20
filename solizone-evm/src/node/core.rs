@@ -22,7 +22,10 @@ use crate::{
         revm_engine::MAX_TX_GAS,
         transaction::{SolizoneTransaction, TransactionKind},
     },
-    node::mempool::{Mempool, MempoolError, PendingTransaction},
+    node::{
+        mempool::{Mempool, MempoolError, PendingTransaction},
+        receipt_store::BlockReceipts,
+    },
     state::{MemoryState, SolizoneCheckpoint},
 };
 
@@ -136,6 +139,8 @@ pub struct TxRecord {
 #[derive(Debug, Clone)]
 pub struct BlockCommit {
     pub block: SolizoneBlock,
+    /// One receipt per block transaction, in order. Persisted with the block.
+    pub receipts: Vec<ExecutionReceipt>,
     pub checkpoint: SolizoneCheckpoint,
     pub rejected: usize,
 }
@@ -180,6 +185,7 @@ impl NodeCore {
 
         let commit = BlockCommit {
             block: produced.block.clone(),
+            receipts: produced.receipts.clone(),
             checkpoint: SolizoneCheckpoint::new(
                 core.state.snapshot(),
                 core.producer.next_height(),
@@ -381,6 +387,7 @@ impl NodeCore {
 
         Some(BlockCommit {
             block,
+            receipts: produced.receipts,
             checkpoint,
             rejected: produced.rejected.len(),
         })
@@ -412,12 +419,26 @@ impl NodeCore {
     }
 
     fn index_block(&mut self, block: &SolizoneBlock, receipts: &[ExecutionReceipt]) {
-        let block_hash = block.hash();
+        self.index_entries(
+            block.header.height,
+            block.hash(),
+            block.header.timestamp,
+            block.transactions.iter().zip(receipts),
+        );
+    }
+
+    fn index_entries<'a>(
+        &mut self,
+        height: u64,
+        block_hash: B256,
+        timestamp: u64,
+        entries: impl Iterator<Item = (&'a SolizoneTransaction, &'a ExecutionReceipt)>,
+    ) {
         let mut cumulative_gas_used = 0;
         let mut log_index = 0;
         let mut hashes = Vec::new();
 
-        for (index, (tx, receipt)) in block.transactions.iter().zip(receipts).enumerate() {
+        for (index, (tx, receipt)) in entries.enumerate() {
             cumulative_gas_used += receipt.gas_used;
 
             if let Some(hash) = tx.eth_hash() {
@@ -427,9 +448,9 @@ impl NodeCore {
                         hash,
                         tx: tx.clone(),
                         receipt: receipt.clone(),
-                        block_number: block.header.height,
+                        block_number: height,
                         block_hash,
-                        block_timestamp: block.header.timestamp,
+                        block_timestamp: timestamp,
                         index: index as u64,
                         cumulative_gas_used,
                         first_log_index: log_index,
@@ -442,7 +463,43 @@ impl NodeCore {
             log_index += receipt.logs.len() as u64;
         }
 
-        self.block_transactions.insert(block.header.height, hashes);
+        self.block_transactions.insert(height, hashes);
+    }
+
+    /// Rebuilds the transaction index from receipts stored by earlier runs.
+    /// Records for heights above the chain head (left by a crash between
+    /// writing receipts and the checkpoint) are ignored, and so is a record
+    /// for the head block whose hash does not match it. Returns the number
+    /// of blocks indexed.
+    pub fn restore_index(&mut self, records: Vec<BlockReceipts>) -> usize {
+        let Some(head) = self.head_height() else {
+            return 0;
+        };
+
+        let head_hash = self.producer.parent_hash();
+
+        let mut restored = 0;
+
+        for record in records {
+            if record.height > head {
+                continue;
+            }
+
+            if record.height == head && record.block_hash != head_hash {
+                continue;
+            }
+
+            self.index_entries(
+                record.height,
+                record.block_hash,
+                record.timestamp,
+                record.entries.iter().map(|(tx, receipt)| (tx, receipt)),
+            );
+
+            restored += 1;
+        }
+
+        restored
     }
 
     fn cache_block(&mut self, block: SolizoneBlock) {
@@ -475,7 +532,7 @@ impl NodeCore {
     }
 
     /// Indexed transactions of a block, in block order. `None` if the block
-    /// was produced before this process started (index not available).
+    /// has no stored receipts (it predates receipt persistence).
     pub fn block_transaction_records(&self, height: u64) -> Option<Vec<&TxRecord>> {
         self.block_transactions.get(&height).map(|hashes| {
             hashes
@@ -956,5 +1013,206 @@ mod tests {
         restored.submit_raw_transaction(&next, NOW + 5).unwrap();
         let commit = restored.produce_block(NOW + 5).unwrap();
         assert_eq!(commit.block.header.height, 2);
+    }
+
+    /// Runs a node through a deploy, an increment (one log) and a transfer
+    /// block, persisting every commit like the runtime does.
+    fn history_with_storage() -> (
+        crate::node::MemoryNodeStorage,
+        Vec<(B256, TxRecord)>,
+        SolizoneCheckpoint,
+        SolizoneBlock,
+    ) {
+        use crate::node::NodeStorage;
+
+        let genesis: Vec<(Address, U256)> = DEV_ACCOUNTS
+            .iter()
+            .map(|account| (account.address, dev_account_balance()))
+            .collect();
+
+        let (mut node, genesis_commit) = NodeCore::new(NodeConfig::default(), &genesis, NOW);
+        let mut storage = crate::node::MemoryNodeStorage::default();
+        storage
+            .persist(
+                genesis_commit.block,
+                &genesis_commit.receipts,
+                &genesis_commit.checkpoint,
+            )
+            .unwrap();
+
+        let signer = dev_signer(1);
+
+        let deploy_hash = node
+            .submit_raw_transaction(
+                &sign_eip1559(
+                    &signer,
+                    TxParams {
+                        chain_id: 9001,
+                        nonce: 0,
+                        to: None,
+                        value: U256::ZERO,
+                        input: counter_initcode(),
+                        gas_limit: 500_000,
+                    },
+                ),
+                NOW,
+            )
+            .unwrap();
+        let commit = node.produce_block(NOW).unwrap();
+        storage
+            .persist(commit.block, &commit.receipts, &commit.checkpoint)
+            .unwrap();
+
+        let counter = node
+            .transaction(&deploy_hash)
+            .unwrap()
+            .receipt
+            .contract_address
+            .unwrap();
+
+        // Two transactions in one block: an increment (emits a log) and a
+        // transfer, so index and first_log_index are not trivially zero.
+        let increment_hash = node
+            .submit_raw_transaction(
+                &sign_eip1559(
+                    &signer,
+                    TxParams {
+                        chain_id: 9001,
+                        nonce: 1,
+                        to: Some(counter),
+                        value: U256::ZERO,
+                        input: Bytes::from(INCREMENT.to_vec()),
+                        gas_limit: 100_000,
+                    },
+                ),
+                NOW + 1,
+            )
+            .unwrap();
+        let transfer_hash = node
+            .submit_raw_transaction(
+                &sign_eip1559(&signer, TxParams::transfer(9001, 2, BOB, 9)),
+                NOW + 1,
+            )
+            .unwrap();
+        let commit = node.produce_block(NOW + 1).unwrap();
+        let head = commit.block.clone();
+        let checkpoint = commit.checkpoint.clone();
+        storage
+            .persist(commit.block, &commit.receipts, &commit.checkpoint)
+            .unwrap();
+
+        let records = [deploy_hash, increment_hash, transfer_hash]
+            .into_iter()
+            .map(|hash| (hash, node.transaction(&hash).unwrap().clone()))
+            .collect();
+
+        (storage, records, checkpoint, head)
+    }
+
+    fn restart(
+        storage: &crate::node::MemoryNodeStorage,
+        checkpoint: SolizoneCheckpoint,
+        head: SolizoneBlock,
+    ) -> NodeCore {
+        use crate::node::NodeStorage;
+
+        let head_height = head.header.height;
+        let mut restored = NodeCore::resume(NodeConfig::default(), checkpoint, Some(head));
+
+        let records = (0..=head_height)
+            .filter_map(|height| storage.block_receipts(height).unwrap())
+            .collect();
+
+        restored.restore_index(records);
+        restored
+    }
+
+    #[test]
+    fn receipts_and_index_survive_restart() {
+        let (storage, records, checkpoint, head) = history_with_storage();
+
+        let restored = restart(&storage, checkpoint, head);
+
+        for (hash, original) in &records {
+            let record = restored
+                .transaction(hash)
+                .expect("transaction indexed after restart");
+
+            assert_eq!(record.hash, original.hash);
+            assert_eq!(record.receipt, original.receipt);
+            assert_eq!(record.tx, original.tx);
+            assert_eq!(record.block_number, original.block_number);
+            assert_eq!(record.block_hash, original.block_hash);
+            assert_eq!(record.block_timestamp, original.block_timestamp);
+            assert_eq!(record.index, original.index);
+            assert_eq!(record.cumulative_gas_used, original.cumulative_gas_used);
+            assert_eq!(record.first_log_index, original.first_log_index);
+        }
+
+        // The block with two transactions lists both, in order.
+        let block_two = restored.block_transaction_records(2).unwrap();
+        assert_eq!(block_two.len(), 2);
+        assert_eq!(block_two[0].index, 0);
+        assert_eq!(block_two[1].index, 1);
+        assert_eq!(block_two[0].receipt.logs.len(), 1);
+
+        // Genesis and the deploy block are indexed too.
+        assert_eq!(restored.block_transaction_records(0).unwrap().len(), 0);
+        assert_eq!(restored.block_transaction_records(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn restore_skips_records_beyond_the_head() {
+        use crate::node::{BlockReceipts, NodeStorage};
+
+        let (storage, _, checkpoint, head) = history_with_storage();
+
+        // A crash after writing receipts but before the checkpoint leaves a
+        // record for a block the chain never adopted.
+        let mut stale = storage.block_receipts(2).unwrap().unwrap();
+        stale.height = 3;
+        stale.block_hash = B256::repeat_byte(0xee);
+
+        let mut restored = NodeCore::resume(NodeConfig::default(), checkpoint, Some(head));
+
+        let mut records: Vec<BlockReceipts> = (0..=2)
+            .filter_map(|height| storage.block_receipts(height).unwrap())
+            .collect();
+        records.push(stale);
+
+        assert_eq!(restored.restore_index(records), 3);
+        assert!(restored.block_transaction_records(3).is_none());
+    }
+
+    #[test]
+    fn restore_ignores_head_record_with_wrong_hash() {
+        use crate::node::NodeStorage;
+
+        let (storage, _, checkpoint, head) = history_with_storage();
+
+        let mut wrong = storage.block_receipts(2).unwrap().unwrap();
+        wrong.block_hash = B256::repeat_byte(0xaa);
+
+        let mut restored = NodeCore::resume(NodeConfig::default(), checkpoint, Some(head));
+
+        assert_eq!(restored.restore_index(vec![wrong]), 0);
+        assert!(restored.block_transaction_records(2).is_none());
+    }
+
+    #[test]
+    fn blocks_without_stored_receipts_stay_unindexed() {
+        use crate::node::NodeStorage;
+
+        let (storage, _, checkpoint, head) = history_with_storage();
+
+        // Simulate a database from before receipt persistence: only block 2's
+        // record exists.
+        let only_head = vec![storage.block_receipts(2).unwrap().unwrap()];
+
+        let mut restored = NodeCore::resume(NodeConfig::default(), checkpoint, Some(head));
+
+        assert_eq!(restored.restore_index(only_head), 1);
+        assert!(restored.block_transaction_records(1).is_none());
+        assert!(restored.block_transaction_records(2).is_some());
     }
 }
