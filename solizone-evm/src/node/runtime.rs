@@ -6,7 +6,10 @@
 //! submission.
 
 use std::{
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -100,11 +103,33 @@ impl NodeHandle {
 
     /// Runs block production every `block_time` on a background thread.
     pub fn spawn_block_producer(&self, block_time: Duration) -> thread::JoinHandle<()> {
+        self.spawn_stoppable_block_producer(block_time, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Like [`NodeHandle::spawn_block_producer`], but the thread also ends
+    /// when `stop` is set (checked at least every 100 ms), so an embedding
+    /// host can shut the node down cleanly.
+    pub fn spawn_stoppable_block_producer(
+        &self,
+        block_time: Duration,
+        stop: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<()> {
         let handle = self.clone();
 
         thread::spawn(move || {
-            loop {
-                thread::sleep(block_time);
+            let tick = Duration::from_millis(100).min(block_time);
+
+            'run: loop {
+                let mut waited = Duration::ZERO;
+
+                while waited < block_time {
+                    if stop.load(Ordering::Relaxed) {
+                        break 'run;
+                    }
+
+                    thread::sleep(tick);
+                    waited += tick;
+                }
 
                 handle.produce_and_persist(unix_now());
 

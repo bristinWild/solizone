@@ -472,6 +472,31 @@ public interface: the Ethereum JSON-RPC, `solizone_publicationStatus` and the
 `solizone_node` command line. Build `solizone_node` here, then point Zoner at
 it with `SOLIZONE_NODE=/path/to/solizone_node` (or put it on `PATH`).
 
+## Embedding the node
+
+`solizone_evm::embedded::EmbeddedNode` runs the whole node (execution,
+mempool, block production, storage and optional Logos publication) inside
+another program, for example a Basecamp module. It owns its own runtime and
+block-production thread, so the host needs neither.
+
+```rust
+use solizone_evm::embedded::{EmbeddedConfig, EmbeddedNode};
+
+let node = EmbeddedNode::start(EmbeddedConfig::local("/path/to/data"))?;
+
+// One JSON-RPC request in, one response out, no socket involved. This is the
+// same method set the HTTP server serves (eth_*, net_*, web3_*, solizone_*).
+let reply = node.request(r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#);
+
+node.stop();
+```
+
+`EmbeddedConfig` can also publish to Logos (`publish: Some(PublishSettings
+{ .. })`) and serve HTTP for Foundry, Zoner or a wallet (`rpc: Some(addr)`).
+Data directory handling, recovery and reset live in `solizone_evm::service`,
+which `solizone_node` uses too. A bad request gets a JSON-RPC error response,
+never a panic.
+
 ## Ethereum JSON-RPC
 
 Standard Ethereum tooling (Foundry, viem, ethers, wallets) talks to the node
@@ -803,6 +828,8 @@ solizone-evm/
 │   │   └── reader.rs
 │   ├── replay.rs
 │   ├── sync.rs
+│   ├── service.rs
+│   ├── embedded.rs
 │   ├── logos_publisher.rs
 │   ├── bin/
 │   │   ├── solizone_node.rs
