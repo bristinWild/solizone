@@ -10,6 +10,7 @@ pub mod logos_publisher;
 pub mod logos_storage_client;
 pub mod memory_block_store;
 pub mod node;
+pub mod publication;
 pub mod publisher;
 pub mod rpc;
 pub mod state;

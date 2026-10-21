@@ -3,6 +3,8 @@
 //! ```text
 //! cargo run --bin solizone_node -- [--storage logos|local] [--rpc 127.0.0.1:8545]
 //!                                  [--block-time 2] [--retention 64] [--data-dir .]
+//!                                  [--publish [--logos-node URL] [--channel-id-file F]
+//!                                   [--sequencer-key-file F] [--funding-address HEX]]
 //! cargo run --bin solizone_node -- reset [--storage logos|local] [--data-dir .]
 //! ```
 //!
@@ -10,6 +12,9 @@
 //! blocks and every checkpoint to Logos Storage through `logosctl`.
 //! `--storage local` keeps everything on local disk: no Basecamp needed,
 //! which is what local development and Zoner use.
+//!
+//! `--publish` also publishes every produced block to Logos as a channel
+//! inscription, through the Logos node's HTTP API (see the README).
 
 use std::{env, fs, net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -19,13 +24,26 @@ use solizone_evm::{
     file_block_store::FileBlockStore,
     hybrid_block_store::HybridBlockStore,
     node::{
-        ChainStorage, NodeConfig, NodeCore, NodeHandle, NodeStorage,
+        ChainStorage, FileReceiptStore, NodeConfig, NodeCore, NodeHandle, NodeStorage,
         dev_accounts::{DEV_ACCOUNTS, dev_account_balance},
         runtime::unix_now,
+    },
+    publication::{
+        FeederConfig, PublicationStore,
+        logos::{self, LogosPublicationConfig},
     },
     rpc,
     state::{FileCheckpointBackend, LogosStorageCheckpointBackend},
 };
+
+/// Same credential locations and funding wallet as the `publish` harness.
+const DEFAULT_CHANNEL_ID_FILE: &str =
+    "../experiments/experiment-003-canonical-block/.secrets/channel_id";
+const DEFAULT_SEQUENCER_KEY_FILE: &str =
+    "../experiments/experiment-003-canonical-block/.secrets/sequencer_key";
+/// Public Logos wallet address (not a key) configured in the Basecamp node.
+const DEFAULT_FUNDING_ADDRESS: &str =
+    "ae5a6c8a01b95f2cc40f596882b3f7b03e02b6a37d4376bc43bda47369ccbe2a";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StorageMode {
@@ -40,11 +58,18 @@ struct Options {
     block_time: Duration,
     retention: usize,
     data_dir: PathBuf,
+    publish: bool,
+    logos_node: String,
+    channel_id_file: PathBuf,
+    sequencer_key_file: PathBuf,
+    funding_address: String,
 }
 
 fn usage() -> String {
     "usage: solizone_node [reset] [--storage logos|local] [--rpc ADDR] \
-     [--block-time SECONDS] [--retention BLOCKS] [--data-dir DIR]"
+     [--block-time SECONDS] [--retention BLOCKS] [--data-dir DIR] \
+     [--publish] [--logos-node URL] [--channel-id-file FILE] \
+     [--sequencer-key-file FILE] [--funding-address HEX]"
         .to_string()
 }
 
@@ -56,6 +81,11 @@ fn parse_options() -> Result<Options, String> {
         block_time: Duration::from_secs(2),
         retention: 64,
         data_dir: env::current_dir().map_err(|error| error.to_string())?,
+        publish: false,
+        logos_node: "http://127.0.0.1:8080".to_string(),
+        channel_id_file: PathBuf::from(DEFAULT_CHANNEL_ID_FILE),
+        sequencer_key_file: PathBuf::from(DEFAULT_SEQUENCER_KEY_FILE),
+        funding_address: DEFAULT_FUNDING_ADDRESS.to_string(),
     };
 
     let mut args = env::args().skip(1);
@@ -95,6 +125,15 @@ fn parse_options() -> Result<Options, String> {
                     .map_err(|error| format!("invalid --retention: {error}"))?
             }
             "--data-dir" => options.data_dir = PathBuf::from(value("--data-dir")?),
+            "--publish" => options.publish = true,
+            "--logos-node" => options.logos_node = value("--logos-node")?,
+            "--channel-id-file" => {
+                options.channel_id_file = PathBuf::from(value("--channel-id-file")?)
+            }
+            "--sequencer-key-file" => {
+                options.sequencer_key_file = PathBuf::from(value("--sequencer-key-file")?)
+            }
+            "--funding-address" => options.funding_address = value("--funding-address")?,
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("unknown argument {other:?}\n{}", usage())),
         }
@@ -119,6 +158,14 @@ impl NodePaths {
         self.root.join("solizone-node-local")
     }
 
+    /// Publication cursor and Logos transaction status.
+    fn publication(&self) -> PathBuf {
+        match self.mode {
+            StorageMode::Logos => self.logos("publication.json"),
+            StorageMode::Local => self.local_root().join("publication.json"),
+        }
+    }
+
     fn owned_paths(&self) -> Vec<PathBuf> {
         match self.mode {
             StorageMode::Logos => [
@@ -128,6 +175,8 @@ impl NodePaths {
                 "archive-work",
                 "checkpoint-work",
                 "latest-checkpoint.cid",
+                "receipts",
+                "publication.json",
             ]
             .iter()
             .map(|name| self.logos(name))
@@ -156,6 +205,8 @@ fn open_storage(paths: &NodePaths, retention: usize) -> Result<Box<dyn NodeStora
                     paths.logos("checkpoint-work"),
                     paths.logos("latest-checkpoint.cid"),
                 ),
+                // Receipts are derived data kept on local disk in both modes.
+                FileReceiptStore::new(paths.logos("receipts")),
             )))
         }
         StorageMode::Local => {
@@ -165,6 +216,7 @@ fn open_storage(paths: &NodePaths, retention: usize) -> Result<Box<dyn NodeStora
             Ok(Box::new(ChainStorage::new(
                 FileBlockStore::new(root.join("blocks")),
                 FileCheckpointBackend::new(root.join("checkpoint.json")),
+                FileReceiptStore::new(root.join("receipts")),
             )))
         }
     }
@@ -203,7 +255,31 @@ fn bootstrap(config: NodeConfig, storage: &mut dyn NodeStorage) -> Result<NodeCo
 
         println!("Recovered node at block #{head_height} ({})", head.hash());
 
-        return Ok(NodeCore::resume(config, checkpoint, Some(head)));
+        let mut core = NodeCore::resume(config, checkpoint, Some(head));
+
+        let mut records = Vec::new();
+        let mut missing = 0u64;
+
+        for height in 0..=head_height {
+            match storage.block_receipts(height)? {
+                Some(record) => records.push(record),
+                None => missing += 1,
+            }
+        }
+
+        let restored = core.restore_index(records);
+
+        println!("Restored transaction index for {restored} block(s)");
+
+        if missing > 0 {
+            eprintln!(
+                "warning: {missing} block(s) have no stored receipts (produced before receipts \
+                 were persisted); their transactions will not resolve over JSON-RPC. \
+                 Run `solizone_node reset` to start a fresh chain."
+            );
+        }
+
+        return Ok(core);
     }
 
     let genesis: Vec<(Address, U256)> = DEV_ACCOUNTS
@@ -213,7 +289,11 @@ fn bootstrap(config: NodeConfig, storage: &mut dyn NodeStorage) -> Result<NodeCo
 
     let (core, genesis_commit) = NodeCore::new(config, &genesis, unix_now());
 
-    storage.persist(genesis_commit.block, &genesis_commit.checkpoint)?;
+    storage.persist(
+        genesis_commit.block,
+        &genesis_commit.receipts,
+        &genesis_commit.checkpoint,
+    )?;
 
     println!("Started fresh chain; genesis block #0 persisted");
     println!();
@@ -226,7 +306,18 @@ fn bootstrap(config: NodeConfig, storage: &mut dyn NodeStorage) -> Result<NodeCo
     Ok(core)
 }
 
+/// Shows warnings (and `RUST_LOG` overrides) from the Logos Zone SDK, which
+/// otherwise stays silent when it cannot reach or authenticate with the node.
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
 fn main() -> Result<(), String> {
+    init_logging();
+
     let options = parse_options()?;
 
     let paths = NodePaths {
@@ -249,10 +340,33 @@ fn main() -> Result<(), String> {
 
     let node = NodeHandle::new(core, storage);
 
+    let publication_config = if options.publish {
+        Some(LogosPublicationConfig {
+            node_url: options.logos_node.clone(),
+            channel_id: logos::read_hex_32(&options.channel_id_file)?,
+            sequencer_key: logos::read_hex_32(&options.sequencer_key_file)?,
+            funding_address: logos::parse_hex_32(&options.funding_address)
+                .map_err(|error| format!("invalid --funding-address: {error}"))?,
+            max_tx_fee: 1_000_000,
+            feeder: FeederConfig::default(),
+        })
+    } else {
+        None
+    };
+
+    let publication_store = PublicationStore::new(paths.publication());
+
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
 
     runtime.block_on(async move {
-        let (address, server) = rpc::start_server(node.clone(), options.rpc).await?;
+        let publication = match publication_config {
+            Some(config) => Some(logos::spawn(config, node.clone(), publication_store)?),
+            None => None,
+        };
+
+        let (address, server) =
+            rpc::start_server_with_publication(node.clone(), options.rpc, publication.clone())
+                .await?;
 
         println!();
         println!("Solizone node running");
@@ -268,6 +382,11 @@ fn main() -> Result<(), String> {
             options.block_time
         );
         println!("  JSON-RPC:   http://{address}");
+        if options.publish {
+            println!("  publishing: Logos node {}", options.logos_node);
+        } else {
+            println!("  publishing: off (start with --publish to publish blocks to Logos)");
+        }
         println!();
 
         node.spawn_block_producer(options.block_time);

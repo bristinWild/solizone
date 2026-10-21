@@ -298,16 +298,67 @@ Flags:
 | `--block-time SECONDS` | `2` | how often pending transactions are sealed into a block |
 | `--retention BLOCKS` | `64` | recent blocks kept locally before archiving (logos mode) |
 | `--data-dir DIR` | current dir | where node data lives |
-| `reset` | | delete the node data for the selected storage mode |
+| `--publish` | off | publish every produced block to Logos (see below) |
+| `--logos-node URL` | `http://127.0.0.1:8080` | HTTP API of the Logos (Basecamp) node |
+| `--channel-id-file FILE` | `../experiments/experiment-003-canonical-block/.secrets/channel_id` | 32-byte hex zone channel id |
+| `--sequencer-key-file FILE` | `../experiments/experiment-003-canonical-block/.secrets/sequencer_key` | 32-byte hex sequencer signing key (secret) |
+| `--funding-address HEX` | the address the `publish` harness uses | public wallet address that pays inscription fees |
+| `reset` | | delete the node data for the selected storage mode (including the publication state) |
+
+### Publishing to Logos
+
+With `--publish` the node sends every block, starting with genesis, to Logos
+as a zone channel inscription, in height order, through the Zone SDK
+sequencer:
+
+```bash
+cargo run --bin solizone_node -- --storage local --publish
+```
+
+- Publication runs behind block production. If the Logos node is down or the
+  sequencer is not ready, the node keeps producing blocks and publication
+  catches up later.
+- A cursor (`next_height`), each block's Logos transaction and its status, and
+  the sequencer checkpoint live together in one atomically written file
+  (`publication.json` next to the node data). After a restart publication
+  continues from the cursor; nothing is published twice or skipped.
+- At most 8 blocks wait for Logos finalization at a time.
+- A block too large for one inscription stops publication permanently (the
+  node keeps running); the reason is stored and reported.
+- If the chain was reset but the publication state was kept (or belongs to
+  another chain), the node refuses to start publishing instead of mixing
+  blocks. `solizone_node reset` clears both.
+
+Progress is available over JSON-RPC:
+
+```bash
+curl -s -X POST -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"solizone_publicationStatus","params":[]}' \
+  http://127.0.0.1:8545
+```
+
+```json
+{"enabled":true,"headHeight":12,"nextHeight":13,"unsubmitted":0,"inFlight":3,
+ "failed":null,"recent":[{"height":12,"blockHash":"0x…","txHash":"0x…","status":"mempool"}]}
+```
+
+Block status is `submitted`, `mempool`, `onchain`, `orphaned` or `finalized`.
+
+The Zone SDK's warnings are printed by default. If publication does not start
+(no `sequencer ready` line), run with more detail:
+
+```bash
+RUST_LOG=debug cargo run --bin solizone_node -- --storage local --publish
+```
 
 The runtime continuously owns:
 
 ```text
 NodeCore  (MemoryState + pending state + BlockProducer + mempool + tx index)
 +
-NodeStorage
-  ├── logos: HybridBlockStore + LogosStorageCheckpointBackend
-  └── local: FileBlockStore   + FileCheckpointBackend
+NodeStorage  (receipts, then block, then checkpoint)
+  ├── logos: HybridBlockStore + LogosStorageCheckpointBackend + FileReceiptStore
+  └── local: FileBlockStore   + FileCheckpointBackend         + FileReceiptStore
 +
 JSON-RPC server (jsonrpsee)
 ```
@@ -384,6 +435,11 @@ cast call <counter> "count()(uint256)" --rpc-url http://127.0.0.1:8545
 ```
 
 `scripts/foundry-smoke.sh` runs that whole flow against a running node.
+
+`scripts/foundry-contracts.sh` goes further with `contracts/Zoo.sol`: an ERC20 with
+constructor args and custom errors, CREATE/CREATE2 factories, a payable vault,
+external library linking, precompiles, environment opcodes, Panic reverts and
+call/delegatecall/staticcall between contracts (35 checks).
 
 Chain id is `9001`. Supported methods:
 
@@ -591,11 +647,13 @@ Not implemented yet:
 - Ethereum fee handling (all fees are zero)
 - fee-based transaction replacement in the mempool
 - historical state queries (only latest / pending state is kept)
-- transaction receipts and the tx-hash index survive only in memory: after
-  a restart, blocks are served from storage but receipts for transactions
-  from before the restart return null
-- publishing produced blocks to Logos from `solizone_node` (still the
-  separate `publish` harness)
+- the transaction index is rebuilt in memory from every stored receipt
+  record on startup (fine for development chains; very long chains would
+  need lazy loading)
+- receipts are kept on local disk, also in Logos mode; they are not yet
+  archived to Logos Storage
+- `--publish` has been verified against a fake sink and with the Logos node
+  unreachable, but not yet against a live Logos node
 - WebSocket subscriptions and CORS for browser clients
 - full imported-block re-execution validation
 - Ethereum MPT state roots
@@ -616,21 +674,36 @@ These are intentionally deferred to the next development phase.
 Signed Ethereum transactions, the Solizone mempool and the Ethereum JSON-RPC
 surface are implemented (see [Ethereum JSON-RPC](#ethereum-json-rpc)).
 
-### 1. Persist receipts and the transaction index
+### Done: persistent receipts and transaction index
 
-So `eth_getTransactionReceipt` and `eth_getLogs` keep working across
-restarts.
+Every block's transactions and receipts are stored next to the block
+(`receipts/<height>.szrb`), written before the block and the checkpoint. On
+restart the node rebuilds its transaction index from them, so
+`eth_getTransactionReceipt`, `eth_getTransactionByHash`, `eth_getLogs` and
+block transaction lists keep working across restarts.
 
-### 2. Durable Logos publisher inside the node
+Receipts cannot be recomputed afterwards (that would need the state of every
+historical block), so a chain created before this change has no receipts for
+its old blocks. The node prints a warning and those old transactions return
+null; run `solizone_node reset` for a fresh chain.
 
-Queue produced blocks and publish them through the Zone SDK from
-`solizone_node`, tracking inclusion and finality.
+`scripts/foundry-restart.sh` tests this end to end with Foundry: it starts its
+own node, sends transactions, restarts the node on the same data and compares
+receipts, transactions, blocks and logs.
 
-### 3. Zoner
+### Done: durable Logos publisher inside the node
+
+`solizone_node --publish` queues produced blocks and publishes them through
+the Zone SDK, tracking inclusion and finality (see
+[Publishing to Logos](#publishing-to-logos)). Still to do: verify against a
+live Logos node, and read published blocks back from the channel to rebuild a
+chain from Logos alone.
+
+### 1. Zoner
 
 Developer toolkit (build, test, deploy) on top of the JSON-RPC surface.
 
-### 4. Independent block validation
+### 2. Independent block validation
 
 A second execution path should be able to consume canonical blocks, re-execute transactions, and independently verify resulting commitments.
 
@@ -661,6 +734,10 @@ solizone-evm/
 │   ├── hybrid_block_store.rs
 │   ├── logos_storage_client.rs
 │   ├── publisher.rs
+│   ├── publication/
+│   │   ├── state.rs
+│   │   ├── feeder.rs
+│   │   └── logos.rs
 │   ├── logos_publisher.rs
 │   ├── bin/
 │   │   ├── solizone_node.rs

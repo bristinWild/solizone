@@ -4,6 +4,7 @@
 pub mod core;
 pub mod dev_accounts;
 pub mod mempool;
+pub mod receipt_store;
 pub mod runtime;
 pub mod storage;
 
@@ -11,5 +12,6 @@ pub use core::{
     BlockCommit, CallError, CallRequest, NodeConfig, NodeCore, StateView, SubmitError, TxRecord,
 };
 pub use mempool::{Mempool, MempoolError, PendingTransaction};
+pub use receipt_store::{BlockReceipts, FileReceiptStore, MemoryReceiptStore, ReceiptStore};
 pub use runtime::NodeHandle;
 pub use storage::{ChainStorage, MemoryNodeStorage, NodeStorage};

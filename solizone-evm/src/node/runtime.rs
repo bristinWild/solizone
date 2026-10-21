@@ -78,7 +78,9 @@ impl NodeHandle {
         let hash = commit.block.hash();
         let tx_count = commit.block.transactions.len();
 
-        let result = self.storage().persist(commit.block, &commit.checkpoint);
+        let result = self
+            .storage()
+            .persist(commit.block, &commit.receipts, &commit.checkpoint);
 
         match result {
             Ok(()) => {
