@@ -303,6 +303,7 @@ Flags:
 | `--channel-id-file FILE` | `../experiments/experiment-003-canonical-block/.secrets/channel_id` | 32-byte hex zone channel id |
 | `--sequencer-key-file FILE` | `../experiments/experiment-003-canonical-block/.secrets/sequencer_key` | 32-byte hex sequencer signing key (secret) |
 | `--funding-address HEX` | the address the `publish` harness uses | public wallet address that pays inscription fees |
+| `--sync-from-logos` | off | rebuild an empty data directory from the channel's finalized blocks (see below) |
 | `reset` | | delete the node data for the selected storage mode (including the publication state) |
 
 ### Publishing to Logos
@@ -339,10 +340,55 @@ curl -s -X POST -H 'content-type: application/json' \
 
 ```json
 {"enabled":true,"headHeight":12,"nextHeight":13,"unsubmitted":0,"inFlight":3,
- "failed":null,"recent":[{"height":12,"blockHash":"0x…","txHash":"0x…","status":"mempool"}]}
+ "failed":null,"recent":[{"height":12,"blockHash":"0x…","txHash":"0x…","status":"submitted"}]}
 ```
 
-Block status is `submitted`, `mempool`, `onchain`, `orphaned` or `finalized`.
+A block is `submitted` once the sequencer holds its transaction and
+`finalized` once Logos finalized it. (`orphaned` is transient: when Logos drops
+a transaction the node rewinds its cursor and publishes that block and the
+following ones again.) The Zone SDK does not report intermediate stages.
+
+**Finalization takes hours.** Logos finalizes a block roughly 43,000 slots
+(about 12 hours at one slot per second) after it was included, so a freshly
+published block stays `submitted` for that long. You can confirm inclusion
+earlier by asking the Logos node for the transaction:
+`curl http://127.0.0.1:8080/cryptarchia/transaction/<txHash>`.
+
+**The Zone SDK version must match the Logos node.** `Cargo.toml` pins the SDK
+to the commit of the node it talks to (`curl <node>/version`). A different
+version fails to parse the node's blocks (`did not match any variant of
+untagged enum OpDe`, `missing field block_root`). If you update the Logos
+node, update the pin.
+
+**Funding.** Inscriptions are paid from a wallet key of the Logos node. On the
+current testnet there is no faucet: start mining in Basecamp (or
+`curl -X PUT <node>/pow/mining/start`) and use the claim address as
+`--funding-address`. An inscription costs about 3,000 base units.
+
+### Syncing a node from Logos
+
+Everything published can be read back. On an empty data directory:
+
+```bash
+cargo run --bin solizone_node -- --storage local --sync-from-logos
+```
+
+The node walks the channel's finalized history on the Logos node, takes the
+Solizone blocks (`SZB1`/`SZB2` inscriptions, in on-chain order, skipping
+anything else and re-published duplicates) and **replays every block** from
+the dev genesis: the block is accepted only if executing its transactions
+reproduces its state root, receipts root and hash. A forged or corrupted block
+stops the import and keeps the verified prefix. The node then starts on the
+imported chain and, with `--publish`, continues publishing after the imported
+head instead of starting over.
+
+- Only *finalized* blocks are read (see the finalization delay above), so the
+  newest blocks of a running chain are not importable yet.
+- Needs an empty data directory (`solizone_node reset` first); it refuses to
+  merge into an existing chain.
+- If the channel has a gap, the importer reports the missing height and the
+  number of later blocks it could not import.
+- The first run reads Logos history from genesis; progress is printed.
 
 The Zone SDK's warnings are printed by default. If publication does not start
 (no `sequencer ready` line), run with more detail:
@@ -417,6 +463,14 @@ continue block production
 A full restart path has been verified with the node stopping at one height and continuing the same parent-linked chain from the next height after recovery.
 
 ---
+
+## Zoner
+
+Zoner, the developer companion to Foundry (`zoner init | node | deploy |
+status | accounts`), lives in its own repository and uses only this node's
+public interface: the Ethereum JSON-RPC, `solizone_publicationStatus` and the
+`solizone_node` command line. Build `solizone_node` here, then point Zoner at
+it with `SOLIZONE_NODE=/path/to/solizone_node` (or put it on `PATH`).
 
 ## Ethereum JSON-RPC
 
@@ -652,10 +706,9 @@ Not implemented yet:
   need lazy loading)
 - receipts are kept on local disk, also in Logos mode; they are not yet
   archived to Logos Storage
-- `--publish` has been verified against a fake sink and with the Logos node
-  unreachable, but not yet against a live Logos node
+- `--sync-from-logos` is verified with in-memory chains, not yet against a
+  live channel (blocks become readable about 12 hours after publication)
 - WebSocket subscriptions and CORS for browser clients
-- full imported-block re-execution validation
 - Ethereum MPT state roots
 - network-distributed canonical head / CID discovery
 - explicit Storage replication policy
@@ -694,18 +747,27 @@ receipts, transactions, blocks and logs.
 ### Done: durable Logos publisher inside the node
 
 `solizone_node --publish` queues produced blocks and publishes them through
-the Zone SDK, tracking inclusion and finality (see
-[Publishing to Logos](#publishing-to-logos)). Still to do: verify against a
-live Logos node, and read published blocks back from the channel to rebuild a
-chain from Logos alone.
+the Zone SDK and tracks finality (see
+[Publishing to Logos](#publishing-to-logos)). Verified against a live Logos
+node: published blocks appear on the channel as `SZB1` inscriptions.
 
-### 1. Zoner
+### Done: read published blocks back from Logos
 
-Developer toolkit (build, test, deploy) on top of the JSON-RPC surface.
+`--sync-from-logos` rebuilds a chain from the channel's finalized inscriptions
+and verifies every block by replaying it (see
+[Syncing a node from Logos](#syncing-a-node-from-logos)).
 
-### 2. Independent block validation
+### Done: Zoner v1
 
-A second execution path should be able to consume canonical blocks, re-execute transactions, and independently verify resulting commitments.
+Lives in its own repository (see [Zoner](#zoner)). Next: a `zoner sync`
+command over `--sync-from-logos` and a Basecamp playground (SoliCamp) on the
+same backend.
+
+### 2. Independent block validation (partly done)
+
+`solizone_evm::replay::ChainReplayer` re-executes blocks and verifies every
+commitment; `--sync-from-logos` uses it. Still open: a standalone validator
+that follows a live channel continuously.
 
 ### 5. Production hardening
 
@@ -737,11 +799,14 @@ solizone-evm/
 │   ├── publication/
 │   │   ├── state.rs
 │   │   ├── feeder.rs
-│   │   └── logos.rs
+│   │   ├── logos.rs
+│   │   └── reader.rs
+│   ├── replay.rs
+│   ├── sync.rs
 │   ├── logos_publisher.rs
 │   ├── bin/
 │   │   ├── solizone_node.rs
-│   │   ├── publish.rs
+│   │   │   ├── publish.rs
 │   │   ├── hybrid_node_restart.rs
 │   │   └── ...
 │   ├── state/

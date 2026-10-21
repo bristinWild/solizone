@@ -5,6 +5,7 @@
 //!                                  [--block-time 2] [--retention 64] [--data-dir .]
 //!                                  [--publish [--logos-node URL] [--channel-id-file F]
 //!                                   [--sequencer-key-file F] [--funding-address HEX]]
+//!                                  [--sync-from-logos]
 //! cargo run --bin solizone_node -- reset [--storage logos|local] [--data-dir .]
 //! ```
 //!
@@ -15,6 +16,10 @@
 //!
 //! `--publish` also publishes every produced block to Logos as a channel
 //! inscription, through the Logos node's HTTP API (see the README).
+//!
+//! `--sync-from-logos` rebuilds the chain from the channel's finalized
+//! inscriptions into an empty data directory, verifying every block by
+//! replaying it, then starts the node on top of it.
 
 use std::{env, fs, net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -29,11 +34,12 @@ use solizone_evm::{
         runtime::unix_now,
     },
     publication::{
-        FeederConfig, PublicationStore,
+        FeederConfig, PublicationState, PublicationStore,
         logos::{self, LogosPublicationConfig},
     },
     rpc,
     state::{FileCheckpointBackend, LogosStorageCheckpointBackend},
+    sync::sync_from_logos,
 };
 
 /// Same credential locations and funding wallet as the `publish` harness.
@@ -63,13 +69,14 @@ struct Options {
     channel_id_file: PathBuf,
     sequencer_key_file: PathBuf,
     funding_address: String,
+    sync_from_logos: bool,
 }
 
 fn usage() -> String {
     "usage: solizone_node [reset] [--storage logos|local] [--rpc ADDR] \
      [--block-time SECONDS] [--retention BLOCKS] [--data-dir DIR] \
      [--publish] [--logos-node URL] [--channel-id-file FILE] \
-     [--sequencer-key-file FILE] [--funding-address HEX]"
+     [--sequencer-key-file FILE] [--funding-address HEX] [--sync-from-logos]"
         .to_string()
 }
 
@@ -86,6 +93,7 @@ fn parse_options() -> Result<Options, String> {
         channel_id_file: PathBuf::from(DEFAULT_CHANNEL_ID_FILE),
         sequencer_key_file: PathBuf::from(DEFAULT_SEQUENCER_KEY_FILE),
         funding_address: DEFAULT_FUNDING_ADDRESS.to_string(),
+        sync_from_logos: false,
     };
 
     let mut args = env::args().skip(1);
@@ -134,6 +142,7 @@ fn parse_options() -> Result<Options, String> {
                 options.sequencer_key_file = PathBuf::from(value("--sequencer-key-file")?)
             }
             "--funding-address" => options.funding_address = value("--funding-address")?,
+            "--sync-from-logos" => options.sync_from_logos = true,
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("unknown argument {other:?}\n{}", usage())),
         }
@@ -237,6 +246,71 @@ fn reset(paths: &NodePaths) -> Result<(), String> {
     Ok(())
 }
 
+/// Genesis balances of every Solizone dev chain. A chain read back from Logos
+/// is replayed from exactly this state.
+fn dev_genesis() -> Vec<(Address, U256)> {
+    DEV_ACCOUNTS
+        .iter()
+        .map(|account| (account.address, dev_account_balance()))
+        .collect()
+}
+
+/// Rebuilds an empty data directory from the channel's finalized history.
+fn sync_storage(
+    runtime: &tokio::runtime::Runtime,
+    options: &Options,
+    paths: &NodePaths,
+    config: &NodeConfig,
+    storage: &mut dyn NodeStorage,
+) -> Result<(), String> {
+    let channel_id = logos::read_hex_32(&options.channel_id_file)?;
+
+    println!(
+        "Syncing from Logos node {} (finalized blocks only; this can take a few minutes)",
+        options.logos_node
+    );
+
+    let report = runtime.block_on(sync_from_logos(
+        storage,
+        config,
+        &dev_genesis(),
+        &options.logos_node,
+        channel_id,
+    ))?;
+
+    println!(
+        "Channel: {} inscription(s), {} Solizone block(s) verified, {} other, {} malformed, \
+         {} duplicate",
+        report.inscriptions, report.imported, report.foreign, report.malformed, report.duplicates
+    );
+
+    let Some((height, hash)) = report.head else {
+        return Err(
+            "no Solizone blocks found on the channel (blocks become readable about 12 hours \
+             after they are published, once Logos finalizes them)"
+                .to_string(),
+        );
+    };
+
+    if report.buffered > 0 {
+        eprintln!(
+            "warning: the channel is missing block #{}; {} later block(s) were not imported",
+            report.next_height, report.buffered
+        );
+    }
+
+    println!("Imported chain up to block #{height} ({hash})");
+
+    // The imported blocks are already on Logos: publication must not start
+    // over from block #0.
+    PublicationStore::new(paths.publication()).save(&PublicationState {
+        next_height: height + 1,
+        ..PublicationState::default()
+    })?;
+
+    Ok(())
+}
+
 /// Recovers from the latest checkpoint, or starts a fresh dev chain.
 fn bootstrap(config: NodeConfig, storage: &mut dyn NodeStorage) -> Result<NodeCore, String> {
     if let Some(checkpoint) = storage.load_checkpoint()? {
@@ -282,12 +356,7 @@ fn bootstrap(config: NodeConfig, storage: &mut dyn NodeStorage) -> Result<NodeCo
         return Ok(core);
     }
 
-    let genesis: Vec<(Address, U256)> = DEV_ACCOUNTS
-        .iter()
-        .map(|account| (account.address, dev_account_balance()))
-        .collect();
-
-    let (core, genesis_commit) = NodeCore::new(config, &genesis, unix_now());
+    let (core, genesis_commit) = NodeCore::new(config, &dev_genesis(), unix_now());
 
     storage.persist(
         genesis_commit.block,
@@ -334,7 +403,14 @@ fn main() -> Result<(), String> {
     let config = NodeConfig::default();
     let chain_id = config.chain_id;
 
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+
     let mut storage = open_storage(&paths, options.retention)?;
+
+    if options.sync_from_logos {
+        sync_storage(&runtime, &options, &paths, &config, storage.as_mut())?;
+    }
+
     let core = bootstrap(config, storage.as_mut())?;
     let head = core.head_height().unwrap_or(0);
 
@@ -355,8 +431,6 @@ fn main() -> Result<(), String> {
     };
 
     let publication_store = PublicationStore::new(paths.publication());
-
-    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
 
     runtime.block_on(async move {
         let publication = match publication_config {

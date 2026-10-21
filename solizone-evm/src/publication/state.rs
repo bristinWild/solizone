@@ -64,6 +64,24 @@ pub struct PublicationState {
     pub sequencer_checkpoint: Option<serde_json::Value>,
 }
 
+/// Converts `TxHash([94, 126, ...])` into `0x`-prefixed lowercase hex, `None` if `value`
+/// is not in that form.
+fn debug_hash_to_hex(value: &str) -> Option<String> {
+    let inner = value.strip_prefix("TxHash([")?.strip_suffix("])")?;
+
+    let bytes: Option<Vec<u8>> = inner
+        .split(',')
+        .map(|part| part.trim().parse::<u8>().ok())
+        .collect();
+
+    let bytes = bytes?;
+
+    (bytes.len() == 32).then(|| {
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("0x{hex}")
+    })
+}
+
 /// Finalized entries kept for status reporting.
 const KEEP_FINALIZED: usize = 256;
 
@@ -159,6 +177,17 @@ impl PublicationState {
         Some(lowest)
     }
 
+    /// Older files stored transaction hashes in Rust debug form
+    /// (`TxHash([1, 2, ...])`); rewrite them as hex so they compare equal to
+    /// the hashes the SDK reports.
+    fn normalize_hashes(&mut self) {
+        for entry in self.entries.values_mut() {
+            if let Some(hex) = debug_hash_to_hex(&entry.tx_hash) {
+                entry.tx_hash = hex;
+            }
+        }
+    }
+
     fn prune(&mut self) {
         let finalized: Vec<u64> = self
             .entries
@@ -192,7 +221,11 @@ impl PublicationStore {
 
     pub fn load(&self) -> Result<PublicationState, String> {
         match fs::read(&self.path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
+            Ok(bytes) => serde_json::from_slice::<PublicationState>(&bytes)
+                .map(|mut state| {
+                    state.normalize_hashes();
+                    state
+                })
                 .map_err(|error| format!("invalid {}: {error}", self.path.display())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 Ok(PublicationState::default())
@@ -328,6 +361,28 @@ mod tests {
         assert_eq!(state.orphan(&hashes(&["t2"])), Some(2));
         assert_eq!(state.next_height, 2);
         assert_eq!(state.entries.keys().copied().collect::<Vec<_>>(), [0, 1]);
+    }
+
+    #[test]
+    fn old_debug_format_hashes_become_hex_on_load() {
+        let path = temp_path("debug-hash");
+        let store = PublicationStore::new(&path);
+
+        let mut state = PublicationState::default();
+        let debug = format!("TxHash({:?})", [7u8; 32]);
+        state.record_submission(0, "h0".into(), debug, None);
+        store.save(&state).unwrap();
+
+        let loaded = store.load().unwrap();
+
+        assert_eq!(loaded.entries[&0].tx_hash, format!("0x{}", "07".repeat(32)));
+
+        // Already-hex hashes and malformed ones are left alone.
+        assert_eq!(debug_hash_to_hex(&"ab".repeat(32)), None);
+        assert_eq!(debug_hash_to_hex("TxHash([1, 2])"), None);
+        assert_eq!(debug_hash_to_hex("TxHash([x])"), None);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

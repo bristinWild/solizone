@@ -9,6 +9,7 @@
 
 pub mod feeder;
 pub mod logos;
+pub mod reader;
 pub mod state;
 
 pub use feeder::{BlockSource, FeederConfig, InscriptionSink, SubmitError, Submitted};
