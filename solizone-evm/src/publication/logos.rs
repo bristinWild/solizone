@@ -69,7 +69,7 @@ impl InscriptionSink for LogosSink {
 
         match self.client.publish(inscription).await {
             Ok((result, checkpoint)) => Ok(Submitted {
-                tx_hash: format!("{:?}", result.inscription_id()),
+                tx_hash: result.inscription_id().to_string(),
                 checkpoint: serde_json::to_value(&checkpoint).ok(),
             }),
             Err(SequencerError::Unavailable { reason }) => {
@@ -96,7 +96,7 @@ fn pending_hashes(checkpoint: &SequencerCheckpoint) -> HashSet<String> {
     checkpoint
         .pending_txs
         .iter()
-        .map(|(hash, _)| format!("{hash:?}"))
+        .map(|(hash, _)| hash.to_string())
         .collect()
 }
 
@@ -189,14 +189,14 @@ pub fn spawn(
                         let orphaned: HashSet<String> = channel_update
                             .orphaned()
                             .iter()
-                            .map(|tx| format!("{:?}", tx.tx_hash()))
+                            .map(|tx| tx.tx_hash().to_string())
                             .collect();
 
                         let mut guard = lock(&state);
                         let mut changed = false;
 
                         for tx in &finalized {
-                            let tx_hash = format!("{:?}", tx.tx_hash);
+                            let tx_hash = tx.tx_hash.to_string();
 
                             if let Some(height) =
                                 guard.set_status(&tx_hash, PublicationStatus::Finalized)

@@ -12,5 +12,7 @@ pub mod memory_block_store;
 pub mod node;
 pub mod publication;
 pub mod publisher;
+pub mod replay;
 pub mod rpc;
 pub mod state;
+pub mod sync;
