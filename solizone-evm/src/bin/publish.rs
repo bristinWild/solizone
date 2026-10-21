@@ -252,6 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_tx_fee: 1_000_000.into(),
 
         priority_fee_percent: FundingConfig::DEFAULT_PRIORITY_FEE_PERCENT,
+        change_pk: None,
     };
 
     /*
@@ -346,13 +347,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("✅ ZoneSequencer Ready");
             }
 
-            Event::MempoolPending(tx_hash) => {
-                println!(
-                    "Existing transaction reached mempool during recovery: {:?}",
-                    tx_hash
-                );
-            }
-
             Event::TurnNotification { notification } => {
                 println!("Turn update: our_turn={}", notification.our_turn_to_write);
             }
@@ -403,10 +397,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
 
-                Event::MempoolPending(tx_hash) => {
-                    println!("Mempool pending: {:?}", tx_hash);
-                }
-
                 Event::Ready => {}
 
                 Event::TurnNotification { notification } => {
@@ -449,19 +439,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         loop {
             match sequencer.next_event().await {
-                Event::MempoolPending(tx_hash) => {
-                    println!("📨 Logos mempool pending: {:?}", tx_hash);
-
-                    if restored_pending_hashes.contains(&tx_hash) {
-                        println!();
-                        println!("✅ Restored Solizone publication accepted by Logos mempool");
-
-                        println!("Logos tx: {:?}", tx_hash);
-
-                        return Ok(());
-                    }
-                }
-
                 Event::BlocksProcessed { checkpoint, .. } => {
                     save_checkpoint(&checkpoint);
 
@@ -518,7 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let inscription = Inscription::try_from(publication.bytes.clone())
             .map_err(|_| "Solizone block exceeds Logos inscription limit")?;
 
-        let started = Instant::now();
+        let _started = Instant::now();
 
         /*
          * IMPORTANT:
@@ -558,25 +535,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          */
         loop {
             match sequencer.next_event().await {
-                Event::MempoolPending(tx_hash) => {
-                    println!("📨 Logos mempool pending: {:?}", tx_hash);
-
-                    if tx_hash == published_tx_hash {
-                        let elapsed = started.elapsed().as_secs_f64();
-
-                        println!();
-                        println!("✅ Solizone block accepted by Logos mempool");
-
-                        println!("Solizone block hash: {}", publication.block_hash);
-
-                        println!("Logos tx hash: {:?}", tx_hash);
-
-                        println!("Publish → mempool: {:.3}s", elapsed);
-
-                        return Ok(());
-                    }
-                }
-
                 Event::BlocksProcessed { checkpoint, .. } => {
                     save_checkpoint(&checkpoint);
 
