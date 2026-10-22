@@ -13,7 +13,7 @@ use revm::primitives::{Address, B256, U256};
 
 use crate::{
     node::{core::NodeConfig, storage::NodeStorage},
-    publication::reader::{self, BlockAssembler, Pushed},
+    publication::reader::{BlockAssembler, Pushed},
     replay::ChainReplayer,
 };
 
@@ -112,6 +112,7 @@ impl<'a> ChainImporter<'a> {
     }
 }
 
+#[cfg(feature = "logos")]
 /// Reads the channel's finalized history from `node_url` and rebuilds the
 /// chain into `storage`. Prints progress as blocks are verified.
 pub async fn sync_from_logos(
@@ -123,7 +124,7 @@ pub async fn sync_from_logos(
 ) -> Result<ImportReport, String> {
     let mut importer = ChainImporter::new(storage, config, genesis)?;
 
-    let summary = reader::read_finalized(node_url, channel_id, |payload| {
+    let summary = crate::publication::reader::read_finalized(node_url, channel_id, |payload| {
         let before = importer.imported();
 
         importer.push(payload)?;

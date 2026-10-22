@@ -30,18 +30,22 @@ use crate::rpc::EthRpc;
 
 use crate::{
     node::{NodeConfig, NodeHandle},
-    publication::{
-        FeederConfig, PublicationHandle, PublicationStore,
-        logos::{self, LogosPublicationConfig},
-    },
+    publication::PublicationHandle,
     rpc,
     service::{self, NodePaths, Start, StorageMode},
+};
+
+#[cfg(feature = "logos")]
+use crate::publication::{
+    FeederConfig, PublicationStore,
+    logos::{self, LogosPublicationConfig},
 };
 
 /// Largest JSON-RPC response the in-process path will produce.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Where and how to publish blocks to Logos.
+#[cfg(feature = "logos")]
 #[derive(Debug, Clone)]
 pub struct PublishSettings {
     /// The Logos node's HTTP API, e.g. `http://127.0.0.1:8080`.
@@ -65,6 +69,7 @@ pub struct EmbeddedConfig {
     /// Also serve JSON-RPC over HTTP at this address.
     pub rpc: Option<SocketAddr>,
     /// Publish produced blocks to Logos.
+    #[cfg(feature = "logos")]
     pub publish: Option<PublishSettings>,
 }
 
@@ -77,6 +82,7 @@ impl EmbeddedConfig {
             retention: 64,
             block_time: Duration::from_secs(2),
             rpc: None,
+            #[cfg(feature = "logos")]
             publish: None,
         }
     }
@@ -125,35 +131,41 @@ impl EmbeddedNode {
             .build()
             .map_err(|error| format!("failed to start runtime: {error}"))?;
 
-        let publication_config = config
-            .publish
-            .as_ref()
-            .map(|settings| -> Result<LogosPublicationConfig, String> {
-                Ok(LogosPublicationConfig {
-                    node_url: settings.logos_node.clone(),
-                    channel_id: logos::read_hex_32(&settings.channel_id_file)?,
-                    sequencer_key: logos::read_hex_32(&settings.sequencer_key_file)?,
-                    funding_address: logos::parse_hex_32(&settings.funding_address)
-                        .map_err(|error| format!("invalid funding address: {error}"))?,
-                    max_tx_fee: 1_000_000,
-                    feeder: FeederConfig::default(),
+        #[cfg(feature = "logos")]
+        let publication: Option<PublicationHandle> = {
+            let publication_config = config
+                .publish
+                .as_ref()
+                .map(|settings| -> Result<LogosPublicationConfig, String> {
+                    Ok(LogosPublicationConfig {
+                        node_url: settings.logos_node.clone(),
+                        channel_id: logos::read_hex_32(&settings.channel_id_file)?,
+                        sequencer_key: logos::read_hex_32(&settings.sequencer_key_file)?,
+                        funding_address: logos::parse_hex_32(&settings.funding_address)
+                            .map_err(|error| format!("invalid funding address: {error}"))?,
+                        max_tx_fee: 1_000_000,
+                        feeder: FeederConfig::default(),
+                    })
                 })
-            })
-            .transpose()?;
+                .transpose()?;
 
-        // The publisher spawns background tasks, so it needs a runtime context.
-        let publication = match publication_config {
-            Some(publication_config) => {
-                let _guard = runtime.enter();
+            // The publisher spawns background tasks, so it needs a runtime context.
+            match publication_config {
+                Some(publication_config) => {
+                    let _guard = runtime.enter();
 
-                Some(logos::spawn(
-                    publication_config,
-                    node.clone(),
-                    PublicationStore::new(paths.publication()),
-                )?)
+                    Some(logos::spawn(
+                        publication_config,
+                        node.clone(),
+                        PublicationStore::new(paths.publication()),
+                    )?)
+                }
+                None => None,
             }
-            None => None,
         };
+
+        #[cfg(not(feature = "logos"))]
+        let publication: Option<PublicationHandle> = None;
 
         let module = rpc::build_module(node.clone(), publication.clone())?;
 

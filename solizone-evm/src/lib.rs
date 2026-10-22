@@ -7,6 +7,7 @@ pub mod eth;
 pub mod execution;
 pub mod file_block_store;
 pub mod hybrid_block_store;
+#[cfg(feature = "logos")]
 pub mod logos_publisher;
 pub mod logos_storage_client;
 pub mod memory_block_store;
