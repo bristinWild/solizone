@@ -190,3 +190,24 @@ fn stopping_ends_block_production_quickly() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_fork_has_its_own_chain_id_and_refuses_transactions_signed_for_another() {
+    let dir = temp_dir("fork");
+    let node = EmbeddedNode::start(EmbeddedConfig {
+        chain_id: 9002,
+        ..config(&dir)
+    })
+    .unwrap();
+
+    assert_eq!(node.info().chain_id, 9002);
+    assert_eq!(call(&node, "eth_chainId", json!([]))["result"], "0x232a");
+
+    // deploy_counter signs for chain 9001.
+    let refused = call(&node, "eth_sendRawTransaction", json!([deploy_counter(0)]));
+    assert!(refused["error"].is_object(), "{refused}");
+    assert_eq!(node.head_height(), Some(0));
+
+    node.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

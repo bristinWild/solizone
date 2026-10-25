@@ -62,6 +62,10 @@ pub struct PublishSettings {
 pub struct EmbeddedConfig {
     /// Directory the node keeps its data in.
     pub data_dir: PathBuf,
+    /// The chain's id (EIP-155). Solizone's canonical dev chain is 9001; a
+    /// fork or a collaboration room uses its own so transactions signed for
+    /// one chain are never valid on another.
+    pub chain_id: u64,
     pub storage: StorageMode,
     /// Recent blocks kept on disk before archiving (Logos storage mode).
     pub retention: usize,
@@ -78,6 +82,7 @@ impl EmbeddedConfig {
     pub fn local(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
+            chain_id: NodeConfig::default().chain_id,
             storage: StorageMode::Local,
             retention: 64,
             block_time: Duration::from_secs(2),
@@ -116,7 +121,10 @@ impl EmbeddedNode {
     pub fn start(config: EmbeddedConfig) -> Result<Self, String> {
         let paths = NodePaths::new(&config.data_dir, config.storage);
 
-        let node_config = NodeConfig::default();
+        let node_config = NodeConfig {
+            chain_id: config.chain_id,
+            ..NodeConfig::default()
+        };
         let chain_id = node_config.chain_id;
 
         let mut storage = service::open_storage(&paths, config.retention)?;
