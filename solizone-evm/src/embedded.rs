@@ -66,6 +66,9 @@ pub struct EmbeddedConfig {
     /// fork or a collaboration room uses its own so transactions signed for
     /// one chain are never valid on another.
     pub chain_id: u64,
+    /// A follower never produces blocks: it applies the host's, verified
+    /// block by block (see [`EmbeddedNode::apply_block`]).
+    pub follower: bool,
     pub storage: StorageMode,
     /// Recent blocks kept on disk before archiving (Logos storage mode).
     pub retention: usize,
@@ -83,6 +86,7 @@ impl EmbeddedConfig {
         Self {
             data_dir: data_dir.into(),
             chain_id: NodeConfig::default().chain_id,
+            follower: false,
             storage: StorageMode::Local,
             retention: 64,
             block_time: Duration::from_secs(2),
@@ -128,7 +132,7 @@ impl EmbeddedNode {
         let chain_id = node_config.chain_id;
 
         let mut storage = service::open_storage(&paths, config.retention)?;
-        let booted = service::bootstrap(node_config, storage.as_mut())?;
+        let booted = service::bootstrap_as(node_config, storage.as_mut(), config.follower)?;
 
         let fresh = matches!(booted.start, Start::Fresh);
 
@@ -191,7 +195,8 @@ impl EmbeddedNode {
         };
 
         let stop = Arc::new(AtomicBool::new(false));
-        let producer = node.spawn_stoppable_block_producer(config.block_time, stop.clone());
+        let producer = (!config.follower)
+            .then(|| node.spawn_stoppable_block_producer(config.block_time, stop.clone()));
 
         Ok(Self {
             runtime: Some(runtime),
@@ -204,7 +209,7 @@ impl EmbeddedNode {
                 publishing: publication.is_some(),
             },
             stop,
-            producer: Some(producer),
+            producer,
             server,
             _publication: publication,
         })
@@ -217,6 +222,34 @@ impl EmbeddedNode {
     /// Height of the newest block, if any.
     pub fn head_height(&self) -> Option<u64> {
         self.node.core().head_height()
+    }
+
+    /// Height the next block must have: the chain length, 0 for a follower
+    /// still waiting for the host's genesis block.
+    pub fn next_height(&self) -> u64 {
+        self.node.core().next_height()
+    }
+
+    /// The encoded block at `height` (what a host sends to followers).
+    pub fn block_bytes(&self, height: u64) -> Result<Option<Vec<u8>>, String> {
+        Ok(self
+            .node
+            .block_by_height(height)?
+            .map(|block| block.encode()))
+    }
+
+    /// Verifies and applies an encoded block from the host. The block must
+    /// be exactly the next one; it is executed and checked against its own
+    /// hash, so a forged or out-of-order block is refused. Returns its
+    /// height. Not meant to be called concurrently.
+    pub fn apply_block(&self, bytes: &[u8]) -> Result<u64, String> {
+        let block = crate::block::SolizoneBlock::decode_and_validate(bytes)
+            .map_err(|error| format!("invalid block: {error:?}"))?;
+
+        self.node
+            .apply_and_persist(&block, crate::node::runtime::unix_now())?;
+
+        Ok(block.header.height)
     }
 
     /// Why block production stopped, if it did (for example a storage error).

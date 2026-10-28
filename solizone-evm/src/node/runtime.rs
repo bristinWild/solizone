@@ -101,6 +101,25 @@ impl NodeHandle {
         Some(height)
     }
 
+    /// Applies a block produced by another node (a follower), then persists
+    /// it. Calls must be serialised by the caller: blocks are applied and
+    /// stored in the order given.
+    pub fn apply_and_persist(&self, block: &SolizoneBlock, now: u64) -> Result<(), String> {
+        let commit = self
+            .core()
+            .apply_block(block, now)
+            .map_err(|error| error.to_string())?;
+
+        let height = commit.block.header.height;
+
+        self.storage()
+            .persist(commit.block, &commit.receipts, &commit.checkpoint)
+            .map_err(|error| {
+                self.core().halt(error.clone());
+                format!("persistence failed at block #{height}: {error}")
+            })
+    }
+
     /// Runs block production every `block_time` on a background thread.
     pub fn spawn_block_producer(&self, block_time: Duration) -> thread::JoinHandle<()> {
         self.spawn_stoppable_block_producer(block_time, Arc::new(AtomicBool::new(false)))

@@ -79,9 +79,6 @@ impl InscriptionSink for LogosSink {
             Err(SequencerError::ChannelStateChanged(reason)) => {
                 Err(SubmitError::Unavailable(reason.to_string()))
             }
-            Err(SequencerError::InvalidMultiSig(reason)) => {
-                Err(SubmitError::Rejected(reason.to_string()))
-            }
         }
     }
 }
@@ -225,7 +222,7 @@ pub fn spawn(
                         }
                     }
                     Event::Ready => println!("Logos publication: sequencer ready"),
-                    Event::TurnNotification { .. } => {}
+                    Event::MempoolPending(_) | Event::TurnNotification { .. } => {}
                 }
             }
         });

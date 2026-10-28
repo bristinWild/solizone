@@ -168,6 +168,16 @@ pub fn bootstrap(
     config: NodeConfig,
     storage: &mut dyn NodeStorage,
 ) -> Result<Bootstrapped, String> {
+    bootstrap_as(config, storage, false)
+}
+
+/// Like [`bootstrap`]. A `follower` with nothing stored does not create a
+/// genesis block: it waits for the host's (see `NodeCore::awaiting_genesis`).
+pub fn bootstrap_as(
+    config: NodeConfig,
+    storage: &mut dyn NodeStorage,
+    follower: bool,
+) -> Result<Bootstrapped, String> {
     if let Some(checkpoint) = storage.load_checkpoint()? {
         let head_height = checkpoint
             .next_height
@@ -206,6 +216,13 @@ pub fn bootstrap(
                 restored_blocks,
                 missing_receipts,
             },
+        });
+    }
+
+    if follower {
+        return Ok(Bootstrapped {
+            core: NodeCore::awaiting_genesis(config, &dev_genesis()),
+            start: Start::Fresh,
         });
     }
 

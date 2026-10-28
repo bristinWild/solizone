@@ -211,3 +211,90 @@ fn a_fork_has_its_own_chain_id_and_refuses_transactions_signed_for_another() {
     node.stop();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+fn wait_for_height(node: &EmbeddedNode, height: u64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    while node.head_height() < Some(height) {
+        assert!(Instant::now() < deadline, "node never reached #{height}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_follower_replays_the_hosts_chain_and_ends_with_the_same_state() {
+    let host_dir = temp_dir("host");
+    let guest_dir = temp_dir("guest");
+
+    let host = EmbeddedNode::start(config(&host_dir)).unwrap();
+    let guest = EmbeddedNode::start(EmbeddedConfig {
+        follower: true,
+        ..config(&guest_dir)
+    })
+    .unwrap();
+
+    // A follower has no chain of its own yet and produces nothing.
+    assert_eq!(guest.head_height(), None);
+    assert_eq!(guest.next_height(), 0);
+
+    let sent = call(&host, "eth_sendRawTransaction", json!([deploy_counter(0)]));
+    let hash = sent["result"].as_str().unwrap().to_string();
+    let receipt = wait_for_receipt(&host, &hash);
+    wait_for_height(&host, 1);
+
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(guest.head_height(), None, "followers do not produce blocks");
+
+    // Out of order is refused, in order is accepted.
+    let second = host.block_bytes(1).unwrap().unwrap();
+    assert!(guest.apply_block(&second).is_err());
+    assert_eq!(guest.next_height(), 0);
+
+    for height in 0..=1 {
+        let bytes = host.block_bytes(height).unwrap().unwrap();
+        assert_eq!(guest.apply_block(&bytes).unwrap(), height);
+    }
+
+    assert_eq!(guest.head_height(), Some(1));
+    assert_eq!(guest.next_height(), 2);
+
+    // Same blocks, same contract, same transaction receipt.
+    let address = receipt["contractAddress"].clone();
+    assert_ne!(
+        call(&guest, "eth_getCode", json!([address, "latest"]))["result"],
+        "0x"
+    );
+    assert_eq!(
+        call(&guest, "eth_getTransactionReceipt", json!([hash]))["result"]["blockHash"],
+        receipt["blockHash"]
+    );
+
+    for height in 0..=1 {
+        assert_eq!(
+            host.block_bytes(height).unwrap(),
+            guest.block_bytes(height).unwrap()
+        );
+    }
+
+    // A forged block (one flipped byte) is refused and changes nothing.
+    let mut forged = host.block_bytes(1).unwrap().unwrap();
+    let last = forged.len() - 1;
+    forged[last] ^= 1;
+    assert!(guest.apply_block(&forged).is_err());
+    assert_eq!(guest.next_height(), 2);
+
+    // The follower's copy survives a restart.
+    guest.stop();
+    let again = EmbeddedNode::start(EmbeddedConfig {
+        follower: true,
+        ..config(&guest_dir)
+    })
+    .unwrap();
+    assert_eq!(again.head_height(), Some(1));
+    assert_eq!(again.next_height(), 2);
+
+    again.stop();
+    host.stop();
+    std::fs::remove_dir_all(&host_dir).unwrap();
+    std::fs::remove_dir_all(&guest_dir).unwrap();
+}

@@ -193,7 +193,7 @@ pub async fn read_finalized(
                 }
             }
             Event::Ready => return Ok(summary),
-            Event::TurnNotification { .. } => {}
+            Event::MempoolPending(_) | Event::TurnNotification { .. } => {}
         }
     }
 }

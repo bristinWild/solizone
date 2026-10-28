@@ -26,6 +26,7 @@ use crate::{
         mempool::{Mempool, MempoolError, PendingTransaction},
         receipt_store::BlockReceipts,
     },
+    replay::{ChainReplayer, ReplayError},
     state::{MemoryState, SolizoneCheckpoint},
 };
 
@@ -197,6 +198,67 @@ impl NodeCore {
         core.cache_block(produced.block);
 
         (core, commit)
+    }
+
+    /// A follower's starting point: the genesis balances are in place but no
+    /// block exists yet. Block #0 (and everything after it) must be applied
+    /// with [`NodeCore::apply_block`], so the chain is exactly the host's,
+    /// including the genesis block's timestamp.
+    pub fn awaiting_genesis(config: NodeConfig, genesis: &[(Address, U256)]) -> Self {
+        let mut state = MemoryState::new();
+
+        for (address, balance) in genesis {
+            state.insert_account_info(*address, AccountInfo::from_balance(*balance));
+        }
+
+        let producer = BlockProducer::new(config.version, config.chain_id, config.block_gas_limit);
+
+        Self::assemble(config, state, producer, None)
+    }
+
+    /// Applies a block produced elsewhere. The block is verified by
+    /// executing it (see [`ChainReplayer`]); on error nothing changes. On
+    /// success the returned commit must be persisted like a produced block.
+    pub fn apply_block(
+        &mut self,
+        block: &SolizoneBlock,
+        now: u64,
+    ) -> Result<BlockCommit, ReplayError> {
+        let current = SolizoneCheckpoint::new(
+            self.state.snapshot(),
+            self.producer.next_height(),
+            self.producer.parent_hash(),
+        );
+
+        let mut replayer = ChainReplayer::from_checkpoint(&self.config, current);
+        let receipts = replayer.apply(block)?;
+        let checkpoint = replayer.checkpoint();
+
+        self.state = MemoryState::from_snapshot(checkpoint.state.clone());
+        self.producer = BlockProducer::resume(
+            self.config.version,
+            self.config.chain_id,
+            self.config.block_gas_limit,
+            checkpoint.next_height,
+            checkpoint.parent_hash,
+        );
+        self.last_timestamp = block.header.timestamp;
+
+        self.index_block(block, &receipts);
+        self.rebuild_pending_state(now);
+        self.cache_block(block.clone());
+
+        Ok(BlockCommit {
+            block: block.clone(),
+            receipts,
+            checkpoint,
+            rejected: 0,
+        })
+    }
+
+    /// Height the next applied block must have.
+    pub fn next_height(&self) -> u64 {
+        self.producer.next_height()
     }
 
     /// Node restarted from a checkpoint whose head block is `head`.
