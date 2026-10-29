@@ -347,6 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("✅ ZoneSequencer Ready");
             }
 
+            Event::MempoolPending(_) => {}
             Event::TurnNotification { notification } => {
                 println!("Turn update: our_turn={}", notification.our_turn_to_write);
             }
@@ -399,6 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 Event::Ready => {}
 
+                Event::MempoolPending(_) => {}
                 Event::TurnNotification { notification } => {
                     println!("Turn update: our_turn={}", notification.our_turn_to_write);
                 }
@@ -458,6 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("ZoneSequencer reconnected");
                 }
 
+                Event::MempoolPending(_) => {}
                 Event::TurnNotification { notification } => {
                     println!(
                         "Turn update: our_turn={} current={:?} start={:?} end={:?}",
@@ -554,6 +557,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("ZoneSequencer reconnected");
                 }
 
+                Event::MempoolPending(_) => {}
                 Event::TurnNotification { notification } => {
                     println!(
                         "Turn update: our_turn={} current={:?} start={:?} end={:?}",

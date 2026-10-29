@@ -3,14 +3,35 @@ name = "solizone-evm"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# The Logos Zone SDK (publishing to and reading from a Logos channel). It pulls
+# in the Logos node crates, including RocksDB, so hosts that only need the EVM
+# node (compile, deploy, call) can build with `default-features = false`.
+default = ["logos"]
+logos = [
+    "dep:lb-zone-sdk",
+    "dep:lb-key-management-system-service",
+    "dep:lb-groth16",
+]
+
+[[bin]]
+name = "publish"
+path = "src/bin/publish.rs"
+required-features = ["logos"]
+
+[[bin]]
+name = "solizone_node"
+path = "src/bin/solizone_node.rs"
+required-features = ["logos"]
+
 [dependencies]
 # Logos Zone SDK pinned to the exact upstream commit of the Logos node it talks
 # to (node 0.3.2, commit 198e378; check with `curl <node>/version`). The SDK must
 # match the Logos node version it talks to: a different commit can fail to parse
 # the node's blocks ("did not match any variant of untagged enum OpDe").
-lb-zone-sdk = { package = "logos-blockchain-zone-sdk", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "198e378" }
-lb-key-management-system-service = { package = "logos-blockchain-key-management-system-service", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "198e378" }
-lb-groth16 = { package = "logos-blockchain-groth16", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "198e378" }
+lb-zone-sdk = { package = "logos-blockchain-zone-sdk", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "2c652646d", optional = true }
+lb-key-management-system-service = { package = "logos-blockchain-key-management-system-service", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "2c652646d", optional = true }
+lb-groth16 = { package = "logos-blockchain-groth16", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "2c652646d", optional = true }
 serde_json = "1"
 tokio = { version = "1", features = [
     "macros",

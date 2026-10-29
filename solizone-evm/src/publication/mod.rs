@@ -8,6 +8,7 @@
 //! Logos is the Zone SDK sequencer ([`logos`]).
 
 pub mod feeder;
+#[cfg(feature = "logos")]
 pub mod logos;
 pub mod reader;
 pub mod state;

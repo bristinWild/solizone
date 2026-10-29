@@ -21,24 +21,16 @@
 //! inscriptions into an empty data directory, verifying every block by
 //! replaying it, then starts the node on top of it.
 
-use std::{env, fs, net::SocketAddr, path::PathBuf, time::Duration};
-
-use revm::primitives::{Address, U256};
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
 use solizone_evm::{
-    file_block_store::FileBlockStore,
-    hybrid_block_store::HybridBlockStore,
-    node::{
-        ChainStorage, FileReceiptStore, NodeConfig, NodeCore, NodeHandle, NodeStorage,
-        dev_accounts::{DEV_ACCOUNTS, dev_account_balance},
-        runtime::unix_now,
-    },
+    node::{NodeConfig, NodeCore, NodeHandle, NodeStorage, dev_accounts::DEV_ACCOUNTS},
     publication::{
         FeederConfig, PublicationState, PublicationStore,
         logos::{self, LogosPublicationConfig},
     },
     rpc,
-    state::{FileCheckpointBackend, LogosStorageCheckpointBackend},
+    service::{self, NodePaths, Start, StorageMode, dev_genesis, open_storage, reset},
     sync::sync_from_logos,
 };
 
@@ -50,12 +42,6 @@ const DEFAULT_SEQUENCER_KEY_FILE: &str =
 /// Public Logos wallet address (not a key) configured in the Basecamp node.
 const DEFAULT_FUNDING_ADDRESS: &str =
     "ae5a6c8a01b95f2cc40f596882b3f7b03e02b6a37d4376bc43bda47369ccbe2a";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StorageMode {
-    Logos,
-    Local,
-}
 
 struct Options {
     reset: bool,
@@ -151,110 +137,6 @@ fn parse_options() -> Result<Options, String> {
     Ok(options)
 }
 
-/// On-disk layout. Logos mode keeps the original `solizone-node-*` paths so
-/// existing node data keeps working; local mode lives in its own directory.
-struct NodePaths {
-    root: PathBuf,
-    mode: StorageMode,
-}
-
-impl NodePaths {
-    fn logos(&self, name: &str) -> PathBuf {
-        self.root.join(format!("solizone-node-{name}"))
-    }
-
-    fn local_root(&self) -> PathBuf {
-        self.root.join("solizone-node-local")
-    }
-
-    /// Publication cursor and Logos transaction status.
-    fn publication(&self) -> PathBuf {
-        match self.mode {
-            StorageMode::Logos => self.logos("publication.json"),
-            StorageMode::Local => self.local_root().join("publication.json"),
-        }
-    }
-
-    fn owned_paths(&self) -> Vec<PathBuf> {
-        match self.mode {
-            StorageMode::Logos => [
-                "blocks",
-                "archive-index.json",
-                "recovery",
-                "archive-work",
-                "checkpoint-work",
-                "latest-checkpoint.cid",
-                "receipts",
-                "publication.json",
-            ]
-            .iter()
-            .map(|name| self.logos(name))
-            .collect(),
-            StorageMode::Local => vec![self.local_root()],
-        }
-    }
-}
-
-fn open_storage(paths: &NodePaths, retention: usize) -> Result<Box<dyn NodeStorage>, String> {
-    match paths.mode {
-        StorageMode::Logos => {
-            for name in ["blocks", "recovery", "archive-work", "checkpoint-work"] {
-                fs::create_dir_all(paths.logos(name)).map_err(|error| error.to_string())?;
-            }
-
-            Ok(Box::new(ChainStorage::new(
-                HybridBlockStore::new(
-                    paths.logos("blocks"),
-                    paths.logos("archive-index.json"),
-                    paths.logos("recovery"),
-                    paths.logos("archive-work"),
-                    retention,
-                ),
-                LogosStorageCheckpointBackend::new(
-                    paths.logos("checkpoint-work"),
-                    paths.logos("latest-checkpoint.cid"),
-                ),
-                // Receipts are derived data kept on local disk in both modes.
-                FileReceiptStore::new(paths.logos("receipts")),
-            )))
-        }
-        StorageMode::Local => {
-            let root = paths.local_root();
-            fs::create_dir_all(root.join("blocks")).map_err(|error| error.to_string())?;
-
-            Ok(Box::new(ChainStorage::new(
-                FileBlockStore::new(root.join("blocks")),
-                FileCheckpointBackend::new(root.join("checkpoint.json")),
-                FileReceiptStore::new(root.join("receipts")),
-            )))
-        }
-    }
-}
-
-fn reset(paths: &NodePaths) -> Result<(), String> {
-    for path in paths.owned_paths() {
-        if path.is_dir() {
-            fs::remove_dir_all(&path)
-        } else if path.exists() {
-            fs::remove_file(&path)
-        } else {
-            Ok(())
-        }
-        .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
-    }
-
-    Ok(())
-}
-
-/// Genesis balances of every Solizone dev chain. A chain read back from Logos
-/// is replayed from exactly this state.
-fn dev_genesis() -> Vec<(Address, U256)> {
-    DEV_ACCOUNTS
-        .iter()
-        .map(|account| (account.address, dev_account_balance()))
-        .collect()
-}
-
 /// Rebuilds an empty data directory from the channel's finalized history.
 fn sync_storage(
     runtime: &tokio::runtime::Runtime,
@@ -311,68 +193,41 @@ fn sync_storage(
     Ok(())
 }
 
-/// Recovers from the latest checkpoint, or starts a fresh dev chain.
+/// Recovers from the latest checkpoint, or starts a fresh dev chain, and
+/// reports how it started.
 fn bootstrap(config: NodeConfig, storage: &mut dyn NodeStorage) -> Result<NodeCore, String> {
-    if let Some(checkpoint) = storage.load_checkpoint()? {
-        let head_height = checkpoint
-            .next_height
-            .checked_sub(1)
-            .ok_or("checkpoint has no produced blocks")?;
+    let booted = service::bootstrap(config, storage)?;
 
-        let head = storage
-            .block_by_height(head_height)?
-            .ok_or_else(|| format!("chain-head block #{head_height} missing from storage"))?;
+    match booted.start {
+        Start::Recovered {
+            head_height,
+            head_hash,
+            restored_blocks,
+            missing_receipts,
+        } => {
+            println!("Recovered node at block #{head_height} ({head_hash})");
+            println!("Restored transaction index for {restored_blocks} block(s)");
 
-        if head.hash() != checkpoint.parent_hash {
-            return Err("checkpoint parent hash does not match stored chain head".to_string());
-        }
-
-        println!("Recovered node at block #{head_height} ({})", head.hash());
-
-        let mut core = NodeCore::resume(config, checkpoint, Some(head));
-
-        let mut records = Vec::new();
-        let mut missing = 0u64;
-
-        for height in 0..=head_height {
-            match storage.block_receipts(height)? {
-                Some(record) => records.push(record),
-                None => missing += 1,
+            if missing_receipts > 0 {
+                eprintln!(
+                    "warning: {missing_receipts} block(s) have no stored receipts (produced \
+                     before receipts were persisted); their transactions will not resolve over \
+                     JSON-RPC. Run `solizone_node reset` to start a fresh chain."
+                );
             }
         }
+        Start::Fresh => {
+            println!("Started fresh chain; genesis block #0 persisted");
+            println!();
+            println!("Dev accounts (10,000 ETH each; PUBLIC test keys, local use only):");
 
-        let restored = core.restore_index(records);
-
-        println!("Restored transaction index for {restored} block(s)");
-
-        if missing > 0 {
-            eprintln!(
-                "warning: {missing} block(s) have no stored receipts (produced before receipts \
-                 were persisted); their transactions will not resolve over JSON-RPC. \
-                 Run `solizone_node reset` to start a fresh chain."
-            );
+            for (index, account) in DEV_ACCOUNTS.iter().enumerate() {
+                println!("  ({index}) {}  {}", account.address, account.private_key);
+            }
         }
-
-        return Ok(core);
     }
 
-    let (core, genesis_commit) = NodeCore::new(config, &dev_genesis(), unix_now());
-
-    storage.persist(
-        genesis_commit.block,
-        &genesis_commit.receipts,
-        &genesis_commit.checkpoint,
-    )?;
-
-    println!("Started fresh chain; genesis block #0 persisted");
-    println!();
-    println!("Dev accounts (10,000 ETH each; PUBLIC test keys, local use only):");
-
-    for (index, account) in DEV_ACCOUNTS.iter().enumerate() {
-        println!("  ({index}) {}  {}", account.address, account.private_key);
-    }
-
-    Ok(core)
+    Ok(booted.core)
 }
 
 /// Shows warnings (and `RUST_LOG` overrides) from the Logos Zone SDK, which
@@ -389,10 +244,7 @@ fn main() -> Result<(), String> {
 
     let options = parse_options()?;
 
-    let paths = NodePaths {
-        root: options.data_dir.clone(),
-        mode: options.storage,
-    };
+    let paths = NodePaths::new(options.data_dir.clone(), options.storage);
 
     if options.reset {
         reset(&paths)?;

@@ -13,8 +13,11 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(feature = "logos")]
 use lb_groth16::fr_from_bytes;
+#[cfg(feature = "logos")]
 use lb_key_management_system_service::keys::{Ed25519Key, ZkPublicKey};
+#[cfg(feature = "logos")]
 use lb_zone_sdk::{
     CommonHttpClient,
     adapter::NodeHttpClient,
@@ -113,12 +116,14 @@ impl BlockAssembler {
 }
 
 /// How far a read got.
+#[cfg(feature = "logos")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadSummary {
     /// Inscriptions seen on the channel.
     pub inscriptions: u64,
 }
 
+#[cfg(feature = "logos")]
 /// Walks the channel's finalized history on `node_url`, calling
 /// `on_payload` with each inscription payload in on-chain order. Returns when
 /// the SDK reports it has caught up with finalized history, or with the
@@ -188,11 +193,12 @@ pub async fn read_finalized(
                 }
             }
             Event::Ready => return Ok(summary),
-            Event::TurnNotification { .. } => {}
+            Event::MempoolPending(_) | Event::TurnNotification { .. } => {}
         }
     }
 }
 
+#[cfg(feature = "logos")]
 fn getrandom_fill(buffer: &mut [u8; 32]) -> Result<(), String> {
     use std::io::Read;
 

@@ -6,7 +6,10 @@
 //! submission.
 
 use std::{
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -98,13 +101,54 @@ impl NodeHandle {
         Some(height)
     }
 
+    /// Applies a block produced by another node (a follower), then persists
+    /// it. Calls must be serialised by the caller: blocks are applied and
+    /// stored in the order given.
+    pub fn apply_and_persist(&self, block: &SolizoneBlock, now: u64) -> Result<(), String> {
+        let commit = self
+            .core()
+            .apply_block(block, now)
+            .map_err(|error| error.to_string())?;
+
+        let height = commit.block.header.height;
+
+        self.storage()
+            .persist(commit.block, &commit.receipts, &commit.checkpoint)
+            .map_err(|error| {
+                self.core().halt(error.clone());
+                format!("persistence failed at block #{height}: {error}")
+            })
+    }
+
     /// Runs block production every `block_time` on a background thread.
     pub fn spawn_block_producer(&self, block_time: Duration) -> thread::JoinHandle<()> {
+        self.spawn_stoppable_block_producer(block_time, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Like [`NodeHandle::spawn_block_producer`], but the thread also ends
+    /// when `stop` is set (checked at least every 100 ms), so an embedding
+    /// host can shut the node down cleanly.
+    pub fn spawn_stoppable_block_producer(
+        &self,
+        block_time: Duration,
+        stop: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<()> {
         let handle = self.clone();
 
         thread::spawn(move || {
-            loop {
-                thread::sleep(block_time);
+            let tick = Duration::from_millis(100).min(block_time);
+
+            'run: loop {
+                let mut waited = Duration::ZERO;
+
+                while waited < block_time {
+                    if stop.load(Ordering::Relaxed) {
+                        break 'run;
+                    }
+
+                    thread::sleep(tick);
+                    waited += tick;
+                }
 
                 handle.produce_and_persist(unix_now());
 
