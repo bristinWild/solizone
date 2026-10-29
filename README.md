@@ -259,7 +259,7 @@ We would rather be clear than oversell.
 
 ## Team and contact
 
-**Bristin Borah**, founder and lead engineer. Full-stack Web3 engineer with 4+ years on EVM chains and Solana, working in Rust and Solidity. [bristinborah.com](https://bristinborah.com) · [github.com/bristinWild](https://github.com/bristinWild)
+**Bristin Borah**, founder [bristinborah.com](https://bristinborah.com) · [github.com/bristinWild](https://github.com/bristinWild)
 
 <!-- Add: demo video link, contact email, any co-builders -->
 
