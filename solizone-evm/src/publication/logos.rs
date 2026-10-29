@@ -17,6 +17,9 @@ use lb_zone_sdk::{
 
 use crate::node::NodeHandle;
 
+/// The Zone SDK's node adapter trait, re-exported so hosts can name it.
+pub use lb_zone_sdk::adapter::Node as LogosNode;
+
 use super::{
     feeder::{self, FeederConfig, InscriptionSink, SubmitError, Submitted},
     state::{
@@ -97,14 +100,88 @@ fn pending_hashes(checkpoint: &SequencerCheckpoint) -> HashSet<String> {
         .collect()
 }
 
-/// Starts publishing `node`'s blocks to Logos in background tasks. Returns
-/// once the sequencer is created; connecting and backfilling continue in the
-/// background, and publication begins when the sequencer reports ready.
+/// Keys and limits for one publication, independent of how the Logos node
+/// is reached.
+#[derive(Debug, Clone)]
+pub struct PublisherSettings {
+    pub channel_id: [u8; 32],
+    pub sequencer_key: [u8; 32],
+    /// Public wallet address that funds inscription fees (not a secret).
+    pub funding_address: [u8; 32],
+    pub max_tx_fee: u64,
+    pub feeder: FeederConfig,
+}
+
+/// A running publication. Dropping it (or calling [`Publisher::stop`]) stops
+/// the background tasks; the persisted state stays on disk so publishing
+/// can resume later.
+pub struct Publisher {
+    handle: PublicationHandle,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Publisher {
+    pub fn handle(&self) -> &PublicationHandle {
+        &self.handle
+    }
+
+    pub fn stop(self) {}
+
+    /// Lets the tasks run for the life of the runtime and returns the handle.
+    pub fn detach(mut self) -> PublicationHandle {
+        self.tasks.clear();
+        self.handle.clone()
+    }
+}
+
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// Starts publishing `node`'s blocks to a Logos node reached over HTTP.
+/// The tasks run until the runtime ends.
 pub fn spawn(
     config: LogosPublicationConfig,
     node: NodeHandle,
     store: PublicationStore,
 ) -> Result<PublicationHandle, String> {
+    let url = config
+        .node_url
+        .parse()
+        .map_err(|error| format!("invalid Logos node URL {:?}: {error}", config.node_url))?;
+
+    let adapter = NodeHttpClient::new(CommonHttpClient::new(None), url);
+
+    let settings = PublisherSettings {
+        channel_id: config.channel_id,
+        sequencer_key: config.sequencer_key,
+        funding_address: config.funding_address,
+        max_tx_fee: config.max_tx_fee,
+        feeder: config.feeder,
+    };
+
+    Ok(spawn_with(settings, adapter, node, store)?.detach())
+}
+
+/// Starts publishing through any Zone SDK node adapter: the HTTP client, or
+/// the in-process Basecamp blockchain module. Needs a tokio runtime context.
+/// Returns once the sequencer is created; connecting and backfilling continue
+/// in the background, and publication begins when the sequencer is ready.
+pub fn spawn_with<N>(
+    settings: PublisherSettings,
+    logos_node: N,
+    node: NodeHandle,
+    store: PublicationStore,
+) -> Result<Publisher, String>
+where
+    N: LogosNode + Clone + Send + Sync + 'static,
+{
+    let config = settings;
+
     let funding_pk = ZkPublicKey::new(
         fr_from_bytes(&config.funding_address)
             .map_err(|error| format!("invalid funding address: {error:?}"))?,
@@ -116,13 +193,6 @@ pub fn spawn(
         priority_fee_percent: FundingConfig::DEFAULT_PRIORITY_FEE_PERCENT,
         change_pk: None,
     };
-
-    let url = config
-        .node_url
-        .parse()
-        .map_err(|error| format!("invalid Logos node URL {:?}: {error}", config.node_url))?;
-
-    let logos_node = NodeHttpClient::new(CommonHttpClient::new(None), url);
 
     let initial = store.load()?;
 
@@ -164,6 +234,7 @@ pub fn spawn(
         checkpoint,
     );
 
+    let mut tasks = Vec::new();
     let client = sequencer.client();
     let mut ready = sequencer.subscribe_ready();
 
@@ -173,7 +244,7 @@ pub fn spawn(
         let state = state.clone();
         let store = store.clone();
 
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             loop {
                 match sequencer.next_event().await {
                     Event::BlocksProcessed {
@@ -225,7 +296,7 @@ pub fn spawn(
                     Event::MempoolPending(_) | Event::TurnNotification { .. } => {}
                 }
             }
-        });
+        }));
     }
 
     // Feeds blocks to the sequencer once it is connected and ready.
@@ -233,16 +304,19 @@ pub fn spawn(
         let state = state.clone();
         let feeder_config = config.feeder.clone();
 
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             if ready.wait_for(|ready| *ready).await.is_err() {
                 return;
             }
 
             feeder::run(LogosSink { client }, node, state, store, feeder_config).await;
-        });
+        }));
     }
 
-    Ok(PublicationHandle::new(state))
+    Ok(Publisher {
+        handle: PublicationHandle::new(state),
+        tasks,
+    })
 }
 
 #[cfg(test)]

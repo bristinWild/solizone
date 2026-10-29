@@ -17,7 +17,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
@@ -118,6 +118,10 @@ pub struct EmbeddedNode {
     producer: Option<JoinHandle<()>>,
     server: Option<ServerHandle>,
     _publication: Option<PublicationHandle>,
+    publication_path: PathBuf,
+    /// A publisher started (and stoppable) after the node began running.
+    #[cfg(feature = "logos")]
+    late_publisher: Mutex<Option<logos::Publisher>>,
 }
 
 impl EmbeddedNode {
@@ -212,7 +216,75 @@ impl EmbeddedNode {
             producer,
             server,
             _publication: publication,
+            publication_path: paths.publication(),
+            #[cfg(feature = "logos")]
+            late_publisher: Mutex::new(None),
         })
+    }
+
+    /// Starts publishing this chain's blocks through `adapter` (the HTTP
+    /// client or the in-process Basecamp blockchain module). Replaces a
+    /// publisher started earlier; progress is kept on disk, so stopping and
+    /// starting again resumes where it left off. Only a block-producing node
+    /// can publish.
+    #[cfg(feature = "logos")]
+    pub fn start_publishing<N>(
+        &self,
+        settings: logos::PublisherSettings,
+        adapter: N,
+    ) -> Result<(), String>
+    where
+        N: logos::LogosNode + Clone + Send + Sync + 'static,
+    {
+        let runtime = self.runtime.as_ref().ok_or("node is stopped")?;
+
+        let mut slot = self
+            .late_publisher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Stop the old one first: two writers must never share the store.
+        drop(slot.take());
+
+        let _guard = runtime.enter();
+
+        *slot = Some(logos::spawn_with(
+            settings,
+            adapter,
+            self.node.clone(),
+            PublicationStore::new(self.publication_path.clone()),
+        )?);
+
+        Ok(())
+    }
+
+    /// Stops publishing. Progress stays on disk.
+    #[cfg(feature = "logos")]
+    pub fn stop_publishing(&self) {
+        drop(
+            self.late_publisher
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
+    }
+
+    /// Progress of the publisher started with [`Self::start_publishing`].
+    #[cfg(feature = "logos")]
+    pub fn publication_state(&self) -> Option<crate::publication::PublicationState> {
+        self.late_publisher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|publisher| publisher.handle().snapshot())
+    }
+
+    /// Publication progress saved on disk, whether or not publishing is
+    /// running now.
+    pub fn saved_publication_state(
+        &self,
+    ) -> Result<crate::publication::PublicationState, String> {
+        crate::publication::PublicationStore::new(self.publication_path.clone()).load()
     }
 
     pub fn info(&self) -> &NodeInfo {
